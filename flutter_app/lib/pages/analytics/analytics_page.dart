@@ -212,8 +212,17 @@ class _AnalyticsPageState extends ConsumerState<AnalyticsPage> {
                                       ),
                                       const SizedBox(height: 24),
                                       Expanded(
-                                        child: LineChart(
-                                          _buildChartData(),
+                                        child: InteractiveViewer(
+                                          constrained: false,
+                                          minScale: 0.5,
+                                          maxScale: 3.0,
+                                          child: SizedBox(
+                                            width: _calculateChartWidth(),
+                                            height: 400,
+                                            child: LineChart(
+                                              _buildChartData(),
+                                            ),
+                                          ),
                                         ),
                                       ),
                                     ],
@@ -259,24 +268,68 @@ class _AnalyticsPageState extends ConsumerState<AnalyticsPage> {
     );
   }
 
+  double _calculateChartWidth() {
+    // Calculate width based on data points: minimum 300, add 50 per data point
+    // This ensures labels don't overlap
+    final baseWidth = 300.0;
+    final widthPerPoint = 50.0;
+    return baseWidth + (_analyticsData.length * widthPerPoint);
+  }
+
   LineChartData _buildChartData() {
+    final maxCount = _analyticsData.isEmpty
+        ? 10
+        : _analyticsData.map((e) => e.count).reduce((a, b) => a > b ? a : b);
+    
+    // Calculate interval for X-axis labels to avoid overlap
+    final xInterval = (_analyticsData.length / 20).ceil().clamp(1, _analyticsData.length);
+    
     return LineChartData(
-      gridData: FlGridData(show: true),
+      gridData: FlGridData(
+        show: true,
+        drawVerticalLine: true,
+        horizontalInterval: 1,
+        verticalInterval: xInterval.toDouble(),
+      ),
       titlesData: FlTitlesData(
         leftTitles: AxisTitles(
-          sideTitles: SideTitles(showTitles: true),
+          sideTitles: SideTitles(
+            showTitles: true,
+            reservedSize: 40,
+            interval: (maxCount / 5).ceil().toDouble().clamp(1, maxCount.toDouble()),
+            getTitlesWidget: (value, meta) {
+              if (value.toInt() == value && value >= 0 && value <= maxCount) {
+                return Padding(
+                  padding: const EdgeInsets.only(right: 8),
+                  child: Text(
+                    value.toInt().toString(),
+                    style: const TextStyle(fontSize: 10),
+                    textAlign: TextAlign.right,
+                  ),
+                );
+              }
+              return const Text('');
+            },
+          ),
         ),
         bottomTitles: AxisTitles(
           sideTitles: SideTitles(
             showTitles: true,
+            reservedSize: 30,
+            interval: xInterval.toDouble(),
             getTitlesWidget: (value, meta) {
-              if (value.toInt() >= 0 && value.toInt() < _analyticsData.length) {
+              final index = value.toInt();
+              if (index >= 0 && index < _analyticsData.length && index % xInterval == 0) {
                 final date = DateTime.fromMillisecondsSinceEpoch(
-                  _analyticsData[value.toInt()].timestamp,
+                  _analyticsData[index].timestamp,
                 );
-                return Text(
-                  '${date.day}/${date.month}',
-                  style: const TextStyle(fontSize: 10),
+                return Padding(
+                  padding: const EdgeInsets.only(top: 8),
+                  child: Text(
+                    '${date.day}/${date.month} ${date.hour}:${date.minute.toString().padLeft(2, '0')}',
+                    style: const TextStyle(fontSize: 9),
+                    textAlign: TextAlign.center,
+                  ),
                 );
               }
               return const Text('');
@@ -302,9 +355,7 @@ class _AnalyticsPageState extends ConsumerState<AnalyticsPage> {
       minX: 0,
       maxX: _analyticsData.length > 0 ? (_analyticsData.length - 1).toDouble() : 1,
       minY: 0,
-      maxY: _analyticsData.isEmpty
-          ? 100
-          : _analyticsData.map((e) => e.count).reduce((a, b) => a > b ? a : b).toDouble() * 1.1,
+      maxY: maxCount.toDouble() * 1.2,
     );
   }
 
@@ -319,13 +370,13 @@ class _AnalyticsPageState extends ConsumerState<AnalyticsPage> {
             Row(
               mainAxisSize: MainAxisSize.min,
               children: [
-                Icon(icon, size: 18, color: AppTheme.primary),
-                const SizedBox(width: 6),
+                Icon(icon, size: 16, color: AppTheme.primary),
+                const SizedBox(width: 4),
                 Expanded(
                   child: Text(
                     label,
                     style: TextStyle(
-                      fontSize: 11,
+                      fontSize: 10,
                       color: AppTheme.mutedForeground,
                     ),
                     overflow: TextOverflow.ellipsis,

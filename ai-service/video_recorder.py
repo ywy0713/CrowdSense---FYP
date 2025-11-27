@@ -27,14 +27,16 @@ class VideoRecorder:
         self.storage_path = Path(storage_path) / zone_id
         self.storage_path.mkdir(parents=True, exist_ok=True)
         
-        # Frame buffer: stores frames for 3 seconds before trigger (90 frames at 30 FPS)
-        self.frame_buffer: Deque[Tuple[np.ndarray, float]] = deque(maxlen=90)
+        # Frame buffer: stores recent frames (kept for compatibility, but not used for pre-recording)
+        # Buffer size reduced since we don't need 3-second pre-buffer anymore
+        self.frame_buffer: Deque[Tuple[np.ndarray, float]] = deque(maxlen=30)
         
         # Recording state
         self.is_recording = False
         self.current_video_writer: Optional[cv2.VideoWriter] = None
         self.recorded_frames_count = 0
         self.recording_start_time: Optional[float] = None
+        self._just_started_recording = False  # Flag to prevent duplicate frame write
         
         # Thread lock for thread-safe operations
         self.lock = threading.Lock()
@@ -69,19 +71,25 @@ class VideoRecorder:
     def add_frame(self, frame: np.ndarray, timestamp: float):
         """
         Add a frame to the buffer (always called at 30 FPS)
-        This maintains a 3-second buffer of frames
+        Buffer is kept for compatibility but not used for pre-recording
         """
         with self.lock:
-            # Always add frames to buffer (maxlen ensures only last 90 frames kept)
+            # Always add frames to buffer (maxlen ensures only last 30 frames kept)
             self.frame_buffer.append((frame.copy(), timestamp))
             
             # If recording, write frame to video
             if self.is_recording and self.current_video_writer is not None:
-                self.current_video_writer.write(frame)
-                self.recorded_frames_count += 1
+                # Skip the first frame if we just started recording and already wrote it
+                if self._just_started_recording and self.recorded_frames_count == 1:
+                    # This is the duplicate frame from add_frame() call right after start_recording()
+                    # Skip it to avoid writing the same frame twice
+                    self._just_started_recording = False
+                else:
+                    self.current_video_writer.write(frame)
+                    self.recorded_frames_count += 1
                 
-                # Stop recording after 7 seconds (210 frames at 30 FPS)
-                if self.recorded_frames_count >= 210:
+                # Stop recording after 10 seconds (300 frames at 30 FPS)
+                if self.recorded_frames_count >= 300:
                     self._stop_recording()
     
     def check_triggers(self, current_count: int, thresholds: dict) -> Tuple[bool, str]:
@@ -95,7 +103,7 @@ class VideoRecorder:
                 self.previous_count = current_count
                 return True, "count_0_to_1"
             
-            # Trigger 2: Count crosses threshold boundaries (e.g., 10, 20, 30...)
+            # Trigger 2: Count crosses defined threshold boundaries (low, medium, high, critical)
             # Get all threshold values
             threshold_values = [
                 thresholds.get('low', 20),
@@ -104,16 +112,8 @@ class VideoRecorder:
                 thresholds.get('critical', 120),
             ]
             
-            # Also check for common threshold increments (10, 20, 30, etc.)
-            # This covers the requirement "when people count crosses each defined threshold"
-            all_thresholds = set(threshold_values)
-            # Add increments of 10 up to critical threshold
-            max_threshold = max(threshold_values) if threshold_values else 120
-            for i in range(10, max_threshold + 1, 10):
-                all_thresholds.add(i)
-            
-            # Check if crossing any threshold upward
-            for threshold in sorted(all_thresholds):
+            # Check if crossing any defined threshold upward
+            for threshold in sorted(threshold_values):
                 if self.previous_count < threshold <= current_count:
                     # Only trigger if we haven't already crossed this threshold in this session
                     # or if we went below and crossed again
@@ -123,7 +123,7 @@ class VideoRecorder:
                         return True, f"threshold_{threshold}"
             
             # Check if crossing any threshold downward (for resetting state)
-            for threshold in sorted(all_thresholds):
+            for threshold in sorted(threshold_values):
                 if self.previous_count >= threshold > current_count:
                     if threshold in self.previous_threshold_crossed:
                         self.previous_threshold_crossed.remove(threshold)
@@ -131,10 +131,10 @@ class VideoRecorder:
             self.previous_count = current_count
             return False, ""
     
-    def start_recording(self, trigger_reason: str) -> bool:
+    def start_recording(self, trigger_reason: str, current_frame: Optional[np.ndarray] = None) -> bool:
         """
         Start recording a video clip
-        Includes 3 seconds before trigger + 7 seconds after
+        Records 10 seconds from trigger point (no pre-buffer)
         """
         with self.lock:
             if self.is_recording:
@@ -150,13 +150,15 @@ class VideoRecorder:
             video_filename = f"recording_{timestamp}_{trigger_reason}.mp4"
             video_path = self.storage_path / video_filename
             
-            # Get frame dimensions from buffer
-            if not self.frame_buffer:
-                print(f"[ERROR] No frames in buffer to start recording")
+            # Get frame dimensions from current frame or buffer
+            if current_frame is not None:
+                height, width = current_frame.shape[:2]
+            elif self.frame_buffer:
+                first_frame, _ = self.frame_buffer[0]
+                height, width = first_frame.shape[:2]
+            else:
+                print(f"[ERROR] No frame available to start recording")
                 return False
-            
-            first_frame, _ = self.frame_buffer[0]
-            height, width = first_frame.shape[:2]
             
             # Use temporary file first, then convert to browser-compatible format
             temp_video_path = video_path.with_suffix('.tmp.mp4')
@@ -247,14 +249,15 @@ class VideoRecorder:
             self._temp_video_path = temp_video_path
             self._final_video_path = video_path
             
-            # Write buffered frames (3 seconds = 90 frames)
-            for buffered_frame, _ in self.frame_buffer:
-                video_writer.write(buffered_frame)
+            # Write current frame if provided (first frame of recording)
+            if current_frame is not None:
+                video_writer.write(current_frame)
             
             # Start recording new frames
             self.current_video_writer = video_writer
             self.is_recording = True
-            self.recorded_frames_count = len(self.frame_buffer)
+            self.recorded_frames_count = 1 if current_frame is not None else 0
+            self._just_started_recording = current_frame is not None  # Set flag if first frame was written
             # Use UTC timestamp to ensure consistency across timezones
             self.recording_start_time = datetime.utcnow().timestamp()
             print(f"[RECORD] Started recording: {video_filename}")
@@ -268,7 +271,7 @@ class VideoRecorder:
                 "timestamp": timestamp_ms,
                 "trigger_reason": trigger_reason,
                 "zone_id": self.zone_id,
-                "duration_seconds": 10,  # 3 seconds pre + 7 seconds post
+                "duration_seconds": 10,  # 10 seconds from trigger point
             }
             self.metadata["videos"].append(video_info)
             self._save_metadata()
@@ -337,6 +340,7 @@ class VideoRecorder:
         self.is_recording = False
         self.recorded_frames_count = 0
         self.recording_start_time = None
+        self._just_started_recording = False
         if hasattr(self, '_temp_video_path'):
             delattr(self, '_temp_video_path')
         if hasattr(self, '_final_video_path'):

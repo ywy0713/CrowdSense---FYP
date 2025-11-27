@@ -86,7 +86,7 @@ class HTTPStreamCapture:
         """Connect to HTTP stream"""
         try:
             print(f"[HTTP Stream] Connecting to {self.url}...")
-            response = requests.get(self.url, stream=True, timeout=10)
+            response = requests.get(self.url, stream=True, timeout=15)
             if response.status_code == 200:
                 self.stream = response.iter_content(chunk_size=1024)
                 self._opened = True
@@ -94,6 +94,17 @@ class HTTPStreamCapture:
             else:
                 print(f"[HTTP Stream] ❌ Failed: HTTP {response.status_code}")
                 self._opened = False
+        except requests.exceptions.Timeout:
+            print(f"[HTTP Stream] ❌ Connection timeout: Unable to connect to {self.url}")
+            print(f"[HTTP Stream] 💡 Please check:")
+            print(f"[HTTP Stream]    1. External camera server is running")
+            print(f"[HTTP Stream]    2. Network connection is available")
+            print(f"[HTTP Stream]    3. Firewall allows connections")
+            self._opened = False
+        except requests.exceptions.ConnectionError as e:
+            print(f"[HTTP Stream] ❌ Connection error: Unable to reach {self.url}")
+            print(f"[HTTP Stream] 💡 Please check if the external camera server is running")
+            self._opened = False
         except Exception as e:
             print(f"[HTTP Stream] ❌ Connection error: {e}")
             self._opened = False
@@ -436,14 +447,32 @@ async def monitor_zone(config: ZoneConfig):
                     print(f"❌ Camera closed unexpectedly for {config.zone_id}, attempting to reopen...")
                     try:
                         camera_url = config.camera_url or config.rtsp_url
-                        camera_index = int(camera_url)
                         cap.release()
                         await asyncio.sleep(0.5)
-                        cap = cv2.VideoCapture(camera_index)
-                        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 160)  # Very low resolution for maximum performance
-                        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 120)
-                        cap.set(cv2.CAP_PROP_FPS, 30)
-                        if cap.isOpened():
+                        
+                        # Use the same logic as initial camera opening
+                        try:
+                            # Try to convert to integer if it's a numeric string (for direct camera)
+                            camera_index = int(camera_url)
+                            print(f"Reopening camera with index: {camera_index}")
+                            cap = cv2.VideoCapture(camera_index)
+                            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                            cap.set(cv2.CAP_PROP_FPS, 30)
+                        except (ValueError, TypeError):
+                            # Use as string URL for RTSP/HTTP streams
+                            print(f"Reopening camera as URL string: {camera_url}")
+                            
+                            # Check if it's an HTTP URL
+                            if camera_url.startswith('http://') or camera_url.startswith('https://'):
+                                print(f"[INFO] HTTP stream detected, using requests for better compatibility")
+                                cap = _create_http_stream_capture(camera_url)
+                            else:
+                                # RTSP or other protocols - use OpenCV directly
+                                cap = cv2.VideoCapture(camera_url)
+                                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                        
+                        if cap is not None and cap.isOpened():
                             zone_captures[config.zone_id] = cap
                             print(f"✅ Camera reopened successfully for {config.zone_id}")
                         else:
@@ -511,8 +540,6 @@ async def monitor_zone(config: ZoneConfig):
                         print(f"[DETECT] [{config.zone_id}] Detection: {count} people (confidence: {confidence:.2f}, detector: {detector_type})")
                     except Exception as e:
                         print(f"[ERROR] Detection error: {e}")
-                        import traceback
-                        traceback.print_exc()
                         count, confidence = 0, 0.0
                 else:
                     # Initialize detector if not ready
@@ -543,7 +570,8 @@ async def monitor_zone(config: ZoneConfig):
                             count, config.thresholds
                         )
                         if should_record:
-                            success = zone_video_recorders[config.zone_id].start_recording(trigger_reason)
+                            # Pass current frame to start recording immediately (no pre-buffer)
+                            success = zone_video_recorders[config.zone_id].start_recording(trigger_reason, current_frame=frame)
                             if not success:
                                 print(f"[WARN] Failed to start recording for zone {config.zone_id} (storage full?)")
                     except Exception as e:
@@ -568,8 +596,6 @@ async def monitor_zone(config: ZoneConfig):
         print(f"Monitoring cancelled for zone: {config.name}")
     except Exception as e:
         print(f"Error monitoring zone {config.zone_id}: {e}")
-        import traceback
-        traceback.print_exc()
     finally:
         # Only release if cap exists and was opened
         if 'cap' in locals() and cap is not None:

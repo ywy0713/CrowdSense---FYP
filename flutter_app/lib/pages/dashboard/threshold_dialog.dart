@@ -63,78 +63,91 @@ class _ThresholdDialogState extends State<ThresholdDialog> {
   @override
   Widget build(BuildContext context) {
     return Dialog(
-      child: Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                const Text(
-                  'Set Congestion Thresholds',
-                  style: TextStyle(
-                    fontSize: 20,
-                    fontWeight: FontWeight.bold,
+      child: ConstrainedBox(
+        constraints: BoxConstraints(
+          maxWidth: MediaQuery.of(context).size.width * 0.9,
+        ),
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                Expanded(
+                  child: Text(
+                    'Set Congestion Thresholds',
+                    style: const TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
+                    ),
+                    overflow: TextOverflow.ellipsis,
+                    maxLines: 1,
                   ),
                 ),
+                const SizedBox(width: 8),
                 IconButton(
                   icon: const Icon(Icons.close),
                   onPressed: () => Navigator.of(context).pop(false),
                   padding: EdgeInsets.zero,
-                  constraints: const BoxConstraints(),
+                  constraints: const BoxConstraints(
+                    minWidth: 40,
+                    minHeight: 40,
+                  ),
                 ),
-              ],
-            ),
-            const SizedBox(height: 8),
-            Text(
-              'Define the people count upper bounds for each level.',
-              style: TextStyle(
-                fontSize: 14,
-                color: AppTheme.mutedForeground,
+                ],
               ),
-            ),
-            const SizedBox(height: 24),
-            Row(
-              children: [
-                Expanded(
-                  child: _buildThresholdField('Low ≤', _lowController),
+              const SizedBox(height: 8),
+              Text(
+                'Define the people count upper bounds for each level.',
+                style: TextStyle(
+                  fontSize: 14,
+                  color: AppTheme.mutedForeground,
                 ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: _buildThresholdField('Medium ≤', _mediumController),
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            Row(
-              children: [
-                Expanded(
-                  child: _buildThresholdField('High ≤', _highController),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: _buildThresholdField('Critical ≤', _criticalController),
-                ),
-              ],
-            ),
-            const SizedBox(height: 24),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.end,
-              children: [
-                TextButton(
-                  onPressed: () => Navigator.of(context).pop(false),
-                  child: const Text('Cancel'),
-                ),
-                const SizedBox(width: 8),
-                ElevatedButton(
-                  onPressed: _saveThresholds,
-                  child: const Text('Save'),
-                ),
-              ],
-            ),
+              ),
+              const SizedBox(height: 24),
+              Row(
+                children: [
+                  Expanded(
+                    child: _buildThresholdField('Low ≤', _lowController),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: _buildThresholdField('Medium ≤', _mediumController),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Expanded(
+                    child: _buildThresholdField('High ≤', _highController),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: _buildThresholdField('Critical ≤', _criticalController),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 24),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.end,
+                children: [
+                  TextButton(
+                    onPressed: () => Navigator.of(context).pop(false),
+                    child: const Text('Cancel'),
+                  ),
+                  const SizedBox(width: 8),
+                  ElevatedButton(
+                    onPressed: _saveThresholds,
+                    child: const Text('Save'),
+                  ),
+                ],
+              ),
           ],
+          ),
         ),
       ),
     );
@@ -167,43 +180,46 @@ class _ThresholdDialogState extends State<ThresholdDialog> {
               mainAxisSize: MainAxisSize.min,
               mainAxisAlignment: MainAxisAlignment.end,
               children: [
-                IconButton(
-                  icon: const Icon(Icons.remove, size: 18),
-                  onPressed: () {
-                    final value = int.tryParse(controller.text) ?? 0;
-                    if (value > 0) {
-                      controller.text = (value - 1).toString();
-                    }
-                  },
-                  padding: EdgeInsets.zero,
-                  constraints: const BoxConstraints(
-                    minWidth: 28,
-                    minHeight: 28,
-                    maxWidth: 28,
-                    maxHeight: 28,
+                Material(
+                  color: Colors.transparent,
+                  child: InkWell(
+                    onTap: () {
+                      final value = int.tryParse(controller.text) ?? 0;
+                      if (value > 0) {
+                        controller.text = (value - 1).toString();
+                      }
+                    },
+                    borderRadius: BorderRadius.circular(4),
+                    child: Container(
+                      width: 20,
+                      height: 20,
+                      alignment: Alignment.center,
+                      child: const Icon(Icons.remove, size: 14),
+                    ),
                   ),
-                  iconSize: 18,
                 ),
-                IconButton(
-                  icon: const Icon(Icons.add, size: 18),
-                  onPressed: () {
-                    final value = int.tryParse(controller.text) ?? 0;
-                    controller.text = (value + 1).toString();
-                  },
-                  padding: EdgeInsets.zero,
-                  constraints: const BoxConstraints(
-                    minWidth: 28,
-                    minHeight: 28,
-                    maxWidth: 28,
-                    maxHeight: 28,
+                const SizedBox(width: 2),
+                Material(
+                  color: Colors.transparent,
+                  child: InkWell(
+                    onTap: () {
+                      final value = int.tryParse(controller.text) ?? 0;
+                      controller.text = (value + 1).toString();
+                    },
+                    borderRadius: BorderRadius.circular(4),
+                    child: Container(
+                      width: 20,
+                      height: 20,
+                      alignment: Alignment.center,
+                      child: const Icon(Icons.add, size: 14),
+                    ),
                   ),
-                  iconSize: 18,
                 ),
               ],
             ),
             suffixIconConstraints: const BoxConstraints(
-              maxWidth: 64,
-              minWidth: 64,
+              maxWidth: 48,
+              minWidth: 48,
             ),
           ),
         ),
