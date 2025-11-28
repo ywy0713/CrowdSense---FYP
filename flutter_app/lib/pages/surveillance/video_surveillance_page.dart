@@ -3,7 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:camera/camera.dart';
 import 'package:video_player/video_player.dart';
-import 'dart:async' show StreamSubscription;
+import 'dart:async' show StreamSubscription, TimeoutException;
 import 'dart:convert';
 import 'package:http/http.dart' as http;
 import '../../services/auth_service.dart';
@@ -27,21 +27,18 @@ class _VideoSurveillancePageState extends ConsumerState<VideoSurveillancePage> {
   List<ZoneData> _zones = [];
   String? _selectedZoneId;
   bool _isLoading = true;
-  bool _isStreaming = false;
   bool _hasShownStreamError = false; // Track if we've shown stream error to avoid spam
   
-  // Video streaming
-  CameraController? _cameraController;
-  VideoPlayerController? _videoPlayerController;
-  // List<CameraDescription>? _cameras; // Not needed - direct camera uses Python service stream
+  // Multiple camera support - maintain controllers for each zone
+  Map<String, WebViewController> _webViewControllers = {};
+  Map<String, VideoPlayerController> _videoPlayerControllers = {};
+  Map<String, CameraController> _cameraControllers = {};
+  Map<String, bool> _streamingStatus = {}; // Track streaming status per zone
   
-  // WebView controller for mobile platforms
-  WebViewController? _webViewController;
-  
-  // Real-time people count
-  int _currentPeopleCount = 0;
-  StreamSubscription<ZoneData?>? _zoneSubscription;
-  StreamSubscription<Map<String, dynamic>?>? _apiPollingSubscription;
+  // Real-time people count per zone
+  Map<String, int> _peopleCounts = {};
+  Map<String, StreamSubscription<ZoneData?>> _zoneSubscriptions = {};
+  Map<String, StreamSubscription<Map<String, dynamic>?>> _apiPollingSubscriptions = {};
 
   @override
   void initState() {
@@ -52,17 +49,31 @@ class _VideoSurveillancePageState extends ConsumerState<VideoSurveillancePage> {
 
   @override
   void dispose() {
-    // Only stop video display, NOT the AI service
-    // AI service continues running in background for dashboard updates
-    // Python AI service uses its own OpenCV VideoCapture, independent of Flutter's camera controller
-    // DO NOT call stopZoneMonitoring here - let it run in background for dashboard
-    _cameraController?.dispose();
-    _videoPlayerController?.dispose();
-    _zoneSubscription?.cancel();
-    _apiPollingSubscription?.cancel();
-    _cameraController = null;
-    _videoPlayerController = null;
-    _webViewController = null;
+    // Dispose all controllers
+    for (var controller in _webViewControllers.values) {
+      // WebView controllers don't need explicit disposal
+    }
+    for (var controller in _videoPlayerControllers.values) {
+      controller.dispose();
+    }
+    for (var controller in _cameraControllers.values) {
+      controller.dispose();
+    }
+    
+    // Cancel all subscriptions
+    for (var subscription in _zoneSubscriptions.values) {
+      subscription.cancel();
+    }
+    for (var subscription in _apiPollingSubscriptions.values) {
+      subscription.cancel();
+    }
+    
+    _webViewControllers.clear();
+    _videoPlayerControllers.clear();
+    _cameraControllers.clear();
+    _zoneSubscriptions.clear();
+    _apiPollingSubscriptions.clear();
+    
     // Note: AI service monitoring continues in background
     super.dispose();
   }
@@ -79,32 +90,64 @@ class _VideoSurveillancePageState extends ConsumerState<VideoSurveillancePage> {
       if (user != null) {
         final zones = await DataService.getUserZones(user.uid);
         
-        // Check for active camera
-        final activeCameraId = ref.read(activeCameraProvider);
+        // Check for active cameras
+        final activeCameras = ref.read(activeCameraProvider);
+        
+        // Check which zones are actually active in Python service
+        List<String> actuallyActiveZones = [];
+        try {
+          final status = await AIService.getStatus();
+          if (status != null) {
+            actuallyActiveZones = (status['active_zones'] as List<dynamic>? ?? [])
+                .map((e) => e.toString())
+                .toList();
+          }
+        } catch (e) {
+          print('⚠️ Failed to check active zones: $e');
+        }
         
         setState(() {
           _zones = zones;
           if (zones.isNotEmpty) {
-            // Prefer active camera if available, otherwise use first zone
-            if (activeCameraId != null && zones.any((z) => z.id == activeCameraId)) {
-              _selectedZoneId = activeCameraId;
-            } else {
-              _selectedZoneId = zones.first.id;
-            }
-            // Auto-start streaming when zone is selected (for both cases)
-            // Use a small delay to ensure UI is ready
-            Future.delayed(const Duration(milliseconds: 500), () {
-              if (mounted && !_isStreaming && _selectedZoneId != null) {
-                _startStreaming();
+            // Only select from actually active zones
+            if (actuallyActiveZones.isNotEmpty) {
+              // Prefer active camera from provider if available and actually active
+              if (activeCameras.isNotEmpty) {
+                final firstActive = activeCameras.first;
+                if (actuallyActiveZones.contains(firstActive) && zones.any((z) => z.id == firstActive)) {
+                  _selectedZoneId = firstActive;
+                } else if (actuallyActiveZones.isNotEmpty) {
+                  // Use first actually active zone
+                  _selectedZoneId = actuallyActiveZones.first;
+                } else {
+                  _selectedZoneId = null;
+                }
+              } else if (actuallyActiveZones.isNotEmpty) {
+                _selectedZoneId = actuallyActiveZones.first;
+              } else {
+                _selectedZoneId = null;
               }
-            });
+            } else {
+              // No active zones
+              _selectedZoneId = null;
+            }
+            
+            // Start streaming for selected zone if it's active
+            // Use a small delay to ensure UI is ready
+            if (_selectedZoneId != null) {
+              Future.delayed(const Duration(milliseconds: 500), () {
+                if (mounted && _selectedZoneId != null) {
+                  _startStreaming(_selectedZoneId!);
+                }
+              });
+            }
           }
           _isLoading = false;
         });
         
-        // Subscribe to real-time people count updates
-        if (_selectedZoneId != null) {
-          _subscribeToPeopleCount(_selectedZoneId!);
+        // Subscribe to real-time people count updates for active zones only
+        for (var zoneId in actuallyActiveZones) {
+          _subscribeToPeopleCount(zoneId);
         }
       }
     } catch (e) {
@@ -114,10 +157,72 @@ class _VideoSurveillancePageState extends ConsumerState<VideoSurveillancePage> {
     }
   }
 
+  Future<List<String>> _getActiveZones() async {
+    try {
+      final status = await AIService.getStatus();
+      if (status != null) {
+        return (status['active_zones'] as List<dynamic>? ?? [])
+            .map((e) => e.toString())
+            .toList();
+      }
+    } catch (e) {
+      print('⚠️ Failed to get active zones: $e');
+    }
+    return [];
+  }
+
+  Future<void> _deactivateCamera(String zoneId) async {
+    try {
+      // Stop AI service monitoring
+      await AIService.stopZoneMonitoring(zoneId);
+      
+      // Remove from active cameras
+      ref.read(activeCameraProvider.notifier).removeActiveCamera(zoneId);
+      
+      // Dispose controllers for this zone
+      _webViewControllers.remove(zoneId);
+      _videoPlayerControllers[zoneId]?.dispose();
+      _videoPlayerControllers.remove(zoneId);
+      _cameraControllers[zoneId]?.dispose();
+      _cameraControllers.remove(zoneId);
+      
+      // Update streaming status
+      setState(() {
+        _streamingStatus[zoneId] = false;
+        // If this was the selected zone, clear selection
+        if (_selectedZoneId == zoneId) {
+          _selectedZoneId = null;
+        }
+      });
+      
+      // Reload zones to update active status
+      _loadZones();
+      
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Camera deactivated successfully'),
+            backgroundColor: Colors.green,
+          ),
+        );
+      }
+    } catch (e) {
+      print('❌ Error deactivating camera: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error deactivating camera: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+  }
+
   void _subscribeToPeopleCount(String zoneId) {
-    // Cancel existing subscriptions
-    _zoneSubscription?.cancel();
-    _apiPollingSubscription?.cancel();
+    // Cancel existing subscriptions for this zone
+    _zoneSubscriptions[zoneId]?.cancel();
+    _apiPollingSubscriptions[zoneId]?.cancel();
     
     print('📡 Subscribing to people count for zone: $zoneId (using API)');
     
@@ -125,28 +230,28 @@ class _VideoSurveillancePageState extends ConsumerState<VideoSurveillancePage> {
     _startApiPolling(zoneId);
     
     // Also try Firebase subscription as backup (if Firebase is available)
-    _zoneSubscription = DataService.subscribeToZone(zoneId).listen((zone) {
+    _zoneSubscriptions[zoneId] = DataService.subscribeToZone(zoneId).listen((zone) {
       if (zone != null && mounted) {
-        print('📥 Received Firebase update: peopleCount=${zone.peopleCount}');
+        print('📥 Received Firebase update for zone $zoneId: peopleCount=${zone.peopleCount}');
         setState(() {
-          _currentPeopleCount = zone.peopleCount;
+          _peopleCounts[zoneId] = zone.peopleCount;
         });
       }
     }, onError: (error) {
       // Ignore Firebase errors - API polling is primary
-      print('⚠️ Firebase subscription error (ignored, using API): $error');
+      print('⚠️ Firebase subscription error for zone $zoneId (ignored, using API): $error');
     });
   }
   
   void _startApiPolling(String zoneId) {
-    _apiPollingSubscription?.cancel();
+    _apiPollingSubscriptions[zoneId]?.cancel();
     
     print('🔄 Starting API polling for zone: $zoneId');
     final baseUrl = AIService.baseUrl;
     print('🔍 Surveillance polling URL: $baseUrl/zones/$zoneId/count (baseUrl=$baseUrl)');
     
     // Poll API every 2 seconds (reduced frequency to avoid spam)
-    _apiPollingSubscription = Stream.periodic(const Duration(seconds: 2)).asyncMap((_) async {
+    _apiPollingSubscriptions[zoneId] = Stream.periodic(const Duration(seconds: 2)).asyncMap((_) async {
       try {
         final url = '$baseUrl/zones/$zoneId/count';
         
@@ -159,7 +264,8 @@ class _VideoSurveillancePageState extends ConsumerState<VideoSurveillancePage> {
           final peopleCount = data['peopleCount'] as int? ?? 0;
           
           // Debug: Always log successful API response to verify connection
-          print('📥 Surveillance API success: zone=$zoneId, count=$peopleCount (current=$_currentPeopleCount), response=${response.body}');
+          final currentCount = _peopleCounts[zoneId] ?? 0;
+          print('📥 Surveillance API success: zone=$zoneId, count=$peopleCount (current=$currentCount), response=${response.body}');
           
           // Always update data, regardless of monitoring status
           // (is_monitoring is just informational)
@@ -186,19 +292,19 @@ class _VideoSurveillancePageState extends ConsumerState<VideoSurveillancePage> {
       }
       return null;
     }).listen((result) {
-      print('🔔 Surveillance API listener received: result=$result, mounted=$mounted');
+      print('🔔 Surveillance API listener received for zone $zoneId: result=$result, mounted=$mounted');
       if (result != null && mounted) {
         final count = result['count'] as int;
-        final previousCount = _currentPeopleCount;
+        final previousCount = _peopleCounts[zoneId] ?? 0;
         
         // Always log when we receive data
         print('✅ Surveillance updating zone $zoneId: count=$count (was $previousCount)');
         
         // Always update UI, even if count is the same (to ensure UI is in sync)
         setState(() {
-          _currentPeopleCount = count;
+          _peopleCounts[zoneId] = count;
         });
-        print('✅ Surveillance UI updated: _currentPeopleCount=$_currentPeopleCount');
+        print('✅ Surveillance UI updated: _peopleCounts[$zoneId]=$count');
         
         // Save to Firebase for analytics (every 5 minutes or when count changes significantly)
         if (count != previousCount) {
@@ -207,7 +313,7 @@ class _VideoSurveillancePageState extends ConsumerState<VideoSurveillancePage> {
       }
       // Removed excessive logging for null result (timeouts are expected)
     }, onError: (error) {
-      print('❌ API polling stream error: $error');
+      print('❌ API polling stream error for zone $zoneId: $error');
     });
   }
   
@@ -234,16 +340,14 @@ class _VideoSurveillancePageState extends ConsumerState<VideoSurveillancePage> {
     }
   }
 
-  Future<void> _startStreaming() async {
-    if (_selectedZoneId == null) return;
-    
-    // Prevent multiple simultaneous calls
-    if (_isStreaming) {
-      print('⚠️ Streaming already in progress, skipping...');
+  Future<void> _startStreaming(String zoneId) async {
+    // Check if already streaming for this zone
+    if (_streamingStatus[zoneId] == true) {
+      print('⚠️ Streaming already active for zone $zoneId, skipping...');
       return;
     }
 
-    final zone = _zones.firstWhere((z) => z.id == _selectedZoneId, orElse: () => _zones.first);
+    final zone = _zones.firstWhere((z) => z.id == zoneId, orElse: () => _zones.first);
     
     // Simplified: No permission check needed
     // Python service handles camera access directly on the backend
@@ -251,14 +355,71 @@ class _VideoSurveillancePageState extends ConsumerState<VideoSurveillancePage> {
     // Python service runs on host machine, not on device
 
     try {
-      // Stop any existing video display (but keep AI service running)
-      await _cameraController?.dispose();
-      await _videoPlayerController?.dispose();
-      _cameraController = null;
-      _videoPlayerController = null;
-      _webViewController = null;
+      // Check if controller already exists for this zone
+      if (_webViewControllers.containsKey(zoneId)) {
+        print('✅ WebView controller already exists for zone $zoneId');
+        setState(() {
+          _streamingStatus[zoneId] = true;
+        });
+        return;
+      }
 
-      if (zone.cameraUrl == 'direct') {
+      // Verify Python service is running and zone is active
+      // DO NOT activate here - activation must be done from Camera Setup page
+      try {
+        final status = await AIService.getStatus();
+        if (status == null) {
+          throw Exception('Python AI service is not running. Please start it first.');
+        }
+        final activeZones = (status['active_zones'] as List<dynamic>? ?? [])
+            .map((e) => e.toString())
+            .toList();
+        if (!activeZones.contains(zoneId)) {
+          // Zone is not active - show error and redirect to camera setup
+          print('⚠️ Zone $zoneId is not active. Please activate it from Camera Setup page first.');
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: const Text('Camera is not active. Please activate it from Camera Setup page first.'),
+                backgroundColor: Colors.orange,
+                duration: const Duration(seconds: 5),
+                action: SnackBarAction(
+                  label: 'Go to Setup',
+                  textColor: Colors.white,
+                  onPressed: () {
+                    // Use microtask to ensure SnackBar closes before navigation
+                    Future.microtask(() {
+                      if (mounted) {
+                        context.go('/camera-setup');
+                      }
+                    });
+                  },
+                ),
+              ),
+            );
+          }
+          return;
+        }
+        print('✅ Python AI service is running for zone: $zoneId');
+      } catch (e) {
+        print('❌ Error checking Python service: $e');
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Error: Python AI service not available. Please ensure it is running at ${AIService.baseUrl}'),
+              backgroundColor: Colors.red,
+              duration: const Duration(seconds: 5),
+            ),
+          );
+        }
+        return;
+      }
+
+      // Wait a bit for Python service to initialize camera (if not already started)
+      print('⏳ Waiting for Python AI service to initialize camera...');
+      await Future.delayed(const Duration(seconds: 1));
+
+      if (zone.cameraUrl == 'direct' || (zone.cameraUrl != null && zone.cameraUrl!.isNotEmpty)) {
         // For direct camera, use Python service's video stream to avoid camera conflict
         // Python service handles the camera access and provides MJPEG stream
         // Wait a bit for Python service to start camera (if not already started)
@@ -318,24 +479,24 @@ class _VideoSurveillancePageState extends ConsumerState<VideoSurveillancePage> {
         // Use unified HTML page approach for Mobile
         // Python service provides /zones/{zone_id}/view endpoint with HTML page
         final baseUrl = AIService.baseUrl;
-        final viewUrl = '$baseUrl/zones/${zone.id}/view';
+        final viewUrl = '$baseUrl/zones/$zoneId/view';
         
         // Mobile: Use WebView to display HTML page with MJPEG stream
-        print('📱 Setting up mobile video stream via WebView: $viewUrl');
+        print('📱 Setting up video stream via WebView for zone $zoneId: $viewUrl');
         try {
-          _webViewController = WebViewController()
+          final webViewController = WebViewController()
             ..setJavaScriptMode(JavaScriptMode.unrestricted)
             ..setBackgroundColor(Colors.black)
             ..setNavigationDelegate(
               NavigationDelegate(
                 onPageStarted: (String url) {
-                  print('📱 WebView page started: $url');
+                  print('📱 WebView page started for zone $zoneId: $url');
                 },
                 onPageFinished: (String url) {
-                  print('✅ WebView page finished: $url');
+                  print('✅ WebView page finished for zone $zoneId: $url');
                 },
                 onWebResourceError: (WebResourceError error) {
-                  print('❌ WebView error: ${error.description} (code: ${error.errorCode})');
+                  print('❌ WebView error for zone $zoneId: ${error.description} (code: ${error.errorCode})');
                   // Only show error for critical failures (not 404s or network timeouts that might be transient)
                   if (mounted && error.errorCode != -2 && error.errorCode != -6) {
                     // Avoid showing multiple error messages
@@ -343,7 +504,7 @@ class _VideoSurveillancePageState extends ConsumerState<VideoSurveillancePage> {
                       _hasShownStreamError = true;
                       ScaffoldMessenger.of(context).showSnackBar(
                         SnackBar(
-                          content: Text('Failed to load video stream: ${error.description}'),
+                          content: Text('Failed to load video stream for ${zone.name}: ${error.description}'),
                           backgroundColor: Colors.red,
                           duration: const Duration(seconds: 5),
                         ),
@@ -361,20 +522,22 @@ class _VideoSurveillancePageState extends ConsumerState<VideoSurveillancePage> {
             )
             ..loadRequest(Uri.parse(viewUrl));
           
+          // Store controller for this zone
+          _webViewControllers[zoneId] = webViewController;
+          
           if (mounted) {
             setState(() {
-              _isStreaming = true;
+              _streamingStatus[zoneId] = true;
             });
           }
-          print('✅ Mobile video stream initialized with WebView');
+          print('✅ Video stream initialized with WebView for zone $zoneId');
         } catch (e) {
-          print('❌ Failed to initialize WebView: $e');
-          _webViewController = null;
+          print('❌ Failed to initialize WebView for zone $zoneId: $e');
           
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(
-                content: Text('Failed to initialize video stream: $e'),
+                content: Text('Failed to initialize video stream for ${zone.name}: $e'),
                 backgroundColor: Colors.red,
                 duration: const Duration(seconds: 5),
               ),
@@ -382,66 +545,47 @@ class _VideoSurveillancePageState extends ConsumerState<VideoSurveillancePage> {
           }
           return;
         }
-      } else if (zone.cameraUrl != null && zone.cameraUrl!.isNotEmpty) {
-        // For HTTP streams (including external cameras), use Python service stream endpoint
-        // Python service reads from external URL and streams it via /zones/{zone_id}/stream
-        final baseUrl = AIService.baseUrl;
-        final viewUrl = '$baseUrl/zones/${zone.id}/view';
-        
-        // Use WebView to display the stream from Python service
-        print('📱 Setting up HTTP video stream via WebView: $viewUrl');
+      } else if (zone.rtspUrl != null && zone.rtspUrl!.isNotEmpty && 
+                 !zone.rtspUrl!.startsWith('http://') && !zone.rtspUrl!.startsWith('https://')) {
+        // Use RTSP stream (only if it's actually RTSP, not HTTP)
+        print('📹 Setting up RTSP stream via VideoPlayer for zone $zoneId: ${zone.rtspUrl}');
         try {
-          _webViewController = WebViewController()
-            ..setJavaScriptMode(JavaScriptMode.unrestricted)
-            ..setBackgroundColor(Colors.black)
-            ..setNavigationDelegate(
-              NavigationDelegate(
-                onPageStarted: (String url) {
-                  print('📱 WebView page started: $url');
-                },
-                onPageFinished: (String url) {
-                  print('✅ WebView page finished: $url');
-                },
-                onWebResourceError: (WebResourceError error) {
-                  print('❌ WebView error: ${error.description} (code: ${error.errorCode})');
-                },
-              ),
-            )
-            ..loadRequest(Uri.parse(viewUrl));
+          final videoPlayerController = VideoPlayerController.networkUrl(
+            Uri.parse(zone.rtspUrl!),
+            videoPlayerOptions: VideoPlayerOptions(
+              allowBackgroundPlayback: false,
+            ),
+          );
+          await videoPlayerController.initialize().timeout(
+            const Duration(seconds: 10),
+            onTimeout: () {
+              throw TimeoutException('Video player initialization timeout');
+            },
+          );
+          videoPlayerController.setLooping(true);
+          videoPlayerController.play();
+          
+          // Store controller for this zone
+          _videoPlayerControllers[zoneId] = videoPlayerController;
           
           if (mounted) {
             setState(() {
-              _isStreaming = true;
+              _streamingStatus[zoneId] = true;
             });
           }
-          print('✅ HTTP video stream initialized with WebView');
+          print('✅ RTSP stream initialized with VideoPlayer for zone $zoneId');
         } catch (e) {
-          print('❌ Failed to initialize WebView: $e');
-          _webViewController = null;
-          
+          print('❌ Failed to initialize RTSP stream for zone $zoneId: $e');
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(
-                content: Text('Failed to initialize video stream: $e'),
+                content: Text('Failed to start RTSP stream for ${zone.name}: $e'),
                 backgroundColor: Colors.red,
                 duration: const Duration(seconds: 5),
               ),
             );
           }
           return;
-        }
-      } else if (zone.rtspUrl != null && zone.rtspUrl!.isNotEmpty) {
-        // Use RTSP stream
-        _videoPlayerController = VideoPlayerController.networkUrl(
-          Uri.parse(zone.rtspUrl!),
-        );
-        await _videoPlayerController!.initialize();
-        _videoPlayerController!.setLooping(true);
-        _videoPlayerController!.play();
-        if (mounted) {
-          setState(() {
-            _isStreaming = true;
-          });
         }
       } else {
         throw Exception('No camera URL configured');
@@ -459,47 +603,6 @@ class _VideoSurveillancePageState extends ConsumerState<VideoSurveillancePage> {
     }
   }
 
-  Future<void> _deactivateCamera() async {
-    if (_selectedZoneId == null) return;
-    
-    try {
-      // Stop video stream display only
-      // DO NOT stop AI service - it should continue running in background for dashboard
-      await _cameraController?.dispose();
-      await _videoPlayerController?.dispose();
-      _cameraController = null;
-      _videoPlayerController = null;
-      _webViewController = null;
-      
-      // Note: AI service monitoring continues in background for dashboard updates
-      // Only stop if user explicitly wants to stop monitoring (not when leaving page)
-      
-      // Clear active camera
-      ref.read(activeCameraProvider.notifier).clearActiveCamera();
-      
-      if (mounted) {
-        setState(() {
-          _isStreaming = false;
-        });
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Camera deactivated successfully'),
-            backgroundColor: Colors.green,
-          ),
-        );
-      }
-    } catch (e) {
-      print('Error deactivating camera: $e');
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Error deactivating camera: $e'),
-            backgroundColor: Colors.red,
-          ),
-        );
-      }
-    }
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -543,159 +646,277 @@ class _VideoSurveillancePageState extends ConsumerState<VideoSurveillancePage> {
                     ],
                   ),
                 )
-              : Column(
-                  children: [
-                    // Zone selector
-                    Padding(
-                      padding: const EdgeInsets.all(16),
-                      child: DropdownButtonFormField<String>(
-                        value: _selectedZoneId,
-                        decoration: const InputDecoration(
-                          labelText: 'Select Zone',
-                          border: OutlineInputBorder(),
-                        ),
-                        items: _zones.map((zone) {
-                          return DropdownMenuItem(
-                            value: zone.id,
-                            child: Text(zone.name),
-                          );
-                        }).toList(),
-                        onChanged: (value) {
-                          setState(() {
-                            _selectedZoneId = value;
-                          });
-                          // Subscribe to new zone's people count
-                          if (value != null) {
-                            _subscribeToPeopleCount(value);
-                          }
-                          // Stop current stream and start new one if streaming
-                          if (_isStreaming) {
-                            _deactivateCamera().then((_) {
-                              _startStreaming();
-                            });
-                          }
-                        },
+              : _selectedZoneId == null
+                  ? Center(
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(Icons.videocam_off, size: 64, color: AppTheme.mutedForeground),
+                          const SizedBox(height: 16),
+                          Text(
+                            'No Active Cameras',
+                            style: TextStyle(
+                              fontSize: 18,
+                              fontWeight: FontWeight.bold,
+                              color: AppTheme.foreground,
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          Text(
+                            'Please activate cameras from Camera Setup page',
+                            style: TextStyle(color: AppTheme.mutedForeground),
+                          ),
+                          const SizedBox(height: 24),
+                          ElevatedButton.icon(
+                            onPressed: () {
+                              context.go('/camera-setup');
+                            },
+                            icon: const Icon(Icons.settings),
+                            label: const Text('Go to Camera Setup'),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: AppTheme.primary,
+                              foregroundColor: Colors.white,
+                              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+                            ),
+                          ),
+                        ],
                       ),
-                    ),
-                    // Video stream area
-                    Expanded(
-                      child: Container(
-                        margin: const EdgeInsets.all(16),
-                        decoration: BoxDecoration(
-                          color: AppTheme.muted,
-                          borderRadius: BorderRadius.circular(12),
-                          border: Border.all(color: AppTheme.border),
-                        ),
-                        child: _isStreaming
-                            ? Stack(
-                                children: [
-                                  _buildVideoView(),
-                                  // People count overlay
-                                  Positioned(
-                                    top: 16,
-                                    left: 16,
-                                    child: Container(
-                                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                                      decoration: BoxDecoration(
-                                        color: Colors.black.withValues(alpha: 0.7),
-                                        borderRadius: BorderRadius.circular(8),
-                                      ),
-                                      child: Row(
-                                        mainAxisSize: MainAxisSize.min,
-                                        children: [
-                                          const Icon(
-                                            Icons.people,
-                                            color: Colors.white,
-                                            size: 20,
+                    )
+                  : SafeArea(
+                      child: Column(
+                        children: [
+                          // Video stream area
+                          Expanded(
+                            child: Container(
+                              margin: const EdgeInsets.all(16),
+                              decoration: BoxDecoration(
+                                color: AppTheme.muted,
+                                borderRadius: BorderRadius.circular(12),
+                                border: Border.all(color: AppTheme.border),
+                              ),
+                              child: _selectedZoneId != null && _streamingStatus[_selectedZoneId] == true
+                                  ? Stack(
+                                      children: [
+                                        _buildVideoView(),
+                                        // People count overlay
+                                        Positioned(
+                                          top: 16,
+                                          left: 16,
+                                          child: Container(
+                                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                                            decoration: BoxDecoration(
+                                              color: Colors.black.withValues(alpha: 0.7),
+                                              borderRadius: BorderRadius.circular(8),
+                                            ),
+                                            child: Row(
+                                              mainAxisSize: MainAxisSize.min,
+                                              children: [
+                                                const Icon(
+                                                  Icons.people,
+                                                  color: Colors.white,
+                                                  size: 20,
+                                                ),
+                                                const SizedBox(width: 8),
+                                                Text(
+                                                  'People detected: ${_peopleCounts[_selectedZoneId] ?? 0}',
+                                                  style: const TextStyle(
+                                                    color: Colors.white,
+                                                    fontSize: 16,
+                                                    fontWeight: FontWeight.bold,
+                                                  ),
+                                                ),
+                                              ],
+                                            ),
                                           ),
-                                          const SizedBox(width: 8),
+                                        ),
+                                        // Zone name overlay
+                                        Positioned(
+                                          top: 16,
+                                          right: 16,
+                                          child: Container(
+                                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                                            decoration: BoxDecoration(
+                                              color: Colors.black.withValues(alpha: 0.7),
+                                              borderRadius: BorderRadius.circular(8),
+                                            ),
+                                            child: Text(
+                                              _zones.firstWhere((z) => z.id == _selectedZoneId, orElse: () => _zones.first).name,
+                                              style: const TextStyle(
+                                                color: Colors.white,
+                                                fontSize: 16,
+                                                fontWeight: FontWeight.bold,
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                        // Deactivate button overlay (bottom right)
+                                        if (_selectedZoneId != null)
+                                          Positioned(
+                                            bottom: 16,
+                                            right: 16,
+                                            child: ElevatedButton.icon(
+                                              onPressed: () => _deactivateCamera(_selectedZoneId!),
+                                              icon: const Icon(Icons.stop, size: 18),
+                                              label: const Text('Deactivate'),
+                                              style: ElevatedButton.styleFrom(
+                                                backgroundColor: AppTheme.destructive,
+                                                foregroundColor: Colors.white,
+                                                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                                              ),
+                                            ),
+                                          ),
+                                      ],
+                                    )
+                                  : Center(
+                                      child: Column(
+                                        mainAxisAlignment: MainAxisAlignment.center,
+                                        children: [
+                                          const CircularProgressIndicator(),
+                                          const SizedBox(height: 16),
                                           Text(
-                                            'People detected: $_currentPeopleCount',
-                                            style: const TextStyle(
-                                              color: Colors.white,
+                                            'Initializing stream...',
+                                            style: TextStyle(
                                               fontSize: 16,
-                                              fontWeight: FontWeight.bold,
+                                              color: AppTheme.foreground,
                                             ),
                                           ),
                                         ],
                                       ),
                                     ),
-                                  ),
-                                ],
-                              )
-                            : Center(
-                                child: Column(
-                                  mainAxisAlignment: MainAxisAlignment.center,
-                                  children: [
-                                    Icon(Icons.videocam_off, size: 64, color: AppTheme.mutedForeground),
-                                    const SizedBox(height: 16),
-                                    Text(
-                                      'Stream Not Active',
-                                      style: TextStyle(
-                                        fontSize: 16,
-                                        fontWeight: FontWeight.bold,
-                                        color: AppTheme.foreground,
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                      ),
-                    ),
-                    // Controls
-                    Padding(
-                      padding: const EdgeInsets.all(16),
-                      child: Column(
-                        children: [
-                          // Deactivate button (only show if camera is active)
-                          if (_isStreaming)
-                            SizedBox(
-                              width: double.infinity,
-                              child: ElevatedButton.icon(
-                                onPressed: _deactivateCamera,
-                                icon: const Icon(Icons.stop),
-                                label: const Text('Deactivate Camera'),
-                                style: ElevatedButton.styleFrom(
-                                  padding: const EdgeInsets.symmetric(vertical: 16),
-                                  backgroundColor: AppTheme.destructive,
-                                  foregroundColor: Colors.white,
-                                ),
-                              ),
                             ),
+                          ),
+                          // Camera switcher (horizontal scrollable tabs) - only show active cameras
+                          FutureBuilder<List<String>>(
+                            future: _getActiveZones(),
+                            builder: (context, snapshot) {
+                              final activeZones = snapshot.data ?? [];
+                              final activeZonesList = _zones.where((z) => activeZones.contains(z.id)).toList();
+                              
+                              if (activeZonesList.isEmpty) {
+                                return const SizedBox.shrink();
+                              }
+                              
+                              return Container(
+                                height: 80,
+                                padding: const EdgeInsets.symmetric(vertical: 8),
+                                child: ListView.builder(
+                                  scrollDirection: Axis.horizontal,
+                                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                                  itemCount: activeZonesList.length,
+                                  itemBuilder: (context, index) {
+                                    final zone = activeZonesList[index];
+                                    final isSelected = zone.id == _selectedZoneId;
+                                    final isStreaming = _streamingStatus[zone.id] == true;
+                                    final peopleCount = _peopleCounts[zone.id] ?? 0;
+                                    
+                                    return GestureDetector(
+                                      onTap: () {
+                                        setState(() {
+                                          _selectedZoneId = zone.id;
+                                        });
+                                        // Start streaming if not already started
+                                        if (!isStreaming) {
+                                          _startStreaming(zone.id);
+                                        }
+                                      },
+                                      child: Container(
+                                        width: 120,
+                                        margin: const EdgeInsets.symmetric(horizontal: 4),
+                                        decoration: BoxDecoration(
+                                          color: isSelected ? AppTheme.primary : AppTheme.muted,
+                                          borderRadius: BorderRadius.circular(12),
+                                          border: Border.all(
+                                            color: isSelected ? AppTheme.primary : AppTheme.border,
+                                            width: isSelected ? 2 : 1,
+                                          ),
+                                        ),
+                                        child: Column(
+                                          mainAxisAlignment: MainAxisAlignment.center,
+                                          children: [
+                                            Icon(
+                                              isStreaming ? Icons.videocam : Icons.videocam_off,
+                                              color: isSelected ? Colors.white : AppTheme.foreground,
+                                              size: 24,
+                                            ),
+                                            const SizedBox(height: 4),
+                                            Text(
+                                              zone.name,
+                                              style: TextStyle(
+                                                color: isSelected ? Colors.white : AppTheme.foreground,
+                                                fontSize: 12,
+                                                fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                                              ),
+                                              textAlign: TextAlign.center,
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis,
+                                            ),
+                                            if (isStreaming)
+                                              Text(
+                                                '$peopleCount people',
+                                                style: TextStyle(
+                                                  color: isSelected ? Colors.white70 : AppTheme.mutedForeground,
+                                                  fontSize: 10,
+                                                ),
+                                              ),
+                                          ],
+                                        ),
+                                      ),
+                                    );
+                                  },
+                                ),
+                              );
+                            },
+                          ),
                         ],
                       ),
                     ),
-                  ],
-                ),
       bottomNavigationBar: const BottomNav(currentIndex: 2),
     );
   }
 
   Widget _buildVideoView() {
-    // Use WebView for mobile platforms
-    if (_webViewController != null) {
-      return WebViewWidget(controller: _webViewController!);
+    if (_selectedZoneId == null) {
+      return const Center(child: CircularProgressIndicator());
     }
-    // Fallback: Use CameraPreview or VideoPlayer (for non-direct camera streams)
-    else if (_cameraController != null && _cameraController!.value.isInitialized) {
-      return CameraPreview(_cameraController!);
-    } else if (_videoPlayerController != null && _videoPlayerController!.value.isInitialized) {
-      return AspectRatio(
-        aspectRatio: _videoPlayerController!.value.aspectRatio,
-        child: VideoPlayer(_videoPlayerController!),
-      );
-    } else {
-      return Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            const CircularProgressIndicator(),
-            const SizedBox(height: 16),
-            const Text('Initializing stream...'),
-          ],
-        ),
-      );
+    
+    // Use WebView for mobile platforms (preferred method)
+    if (_webViewControllers.containsKey(_selectedZoneId)) {
+      return WebViewWidget(controller: _webViewControllers[_selectedZoneId]!);
     }
+    
+    // Fallback: Use VideoPlayer for RTSP streams
+    if (_videoPlayerControllers.containsKey(_selectedZoneId)) {
+      final controller = _videoPlayerControllers[_selectedZoneId]!;
+      if (controller.value.isInitialized) {
+        return AspectRatio(
+          aspectRatio: controller.value.aspectRatio,
+          child: VideoPlayer(controller),
+        );
+      }
+    }
+    
+    // Fallback: Use CameraPreview (if available)
+    if (_cameraControllers.containsKey(_selectedZoneId)) {
+      final controller = _cameraControllers[_selectedZoneId]!;
+      if (controller.value.isInitialized) {
+        return CameraPreview(controller);
+      }
+    }
+    
+    // Loading state
+    return Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          const CircularProgressIndicator(),
+          const SizedBox(height: 16),
+          Text(
+            'Initializing stream for ${_zones.firstWhere((z) => z.id == _selectedZoneId, orElse: () => _zones.first).name}...',
+            style: TextStyle(color: AppTheme.foreground),
+          ),
+        ],
+      ),
+    );
   }
 }
 

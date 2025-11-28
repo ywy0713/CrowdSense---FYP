@@ -1,9 +1,12 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:firebase_database/firebase_database.dart';
+import 'package:firebase_core/firebase_core.dart';
 import '../../services/auth_service.dart';
 import '../../services/data_service.dart';
 import '../../theme/app_theme.dart';
 import '../../providers/active_camera_provider.dart';
+import '../../core/config/firebase_config.dart';
 import 'dart:convert';
 
 class NotificationsPage extends ConsumerStatefulWidget {
@@ -30,15 +33,18 @@ class _NotificationsPageState extends ConsumerState<NotificationsPage> {
   @override
   Widget build(BuildContext context) {
     // Watch active camera provider
-    final activeCameraId = ref.watch(activeCameraProvider);
+    final activeCameras = ref.watch(activeCameraProvider);
+    final activeCameraId = activeCameras.isNotEmpty ? activeCameras.first : null;
 
     // Update selected zone if active camera changed
     if (activeCameraId != null && activeCameraId != _selectedZoneId) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
+      WidgetsBinding.instance.addPostFrameCallback((_) async {
         setState(() {
           _selectedZoneId = activeCameraId;
-          _subscribeToAlerts();
         });
+        // Load read status first, then subscribe to alerts
+        await _loadReadStatusFromFirebase(activeCameraId);
+        _subscribeToAlerts();
       });
     }
 
@@ -195,11 +201,15 @@ class _NotificationsPageState extends ConsumerState<NotificationsPage> {
                           child: Text(zone.name),
                         );
                       }).toList(),
-                      onChanged: (value) {
+                      onChanged: (value) async {
                         setState(() {
                           _selectedZoneId = value;
                         });
-                        _subscribeToAlerts();
+                        if (value != null) {
+                          // Load read status first, then subscribe to alerts
+                          await _loadReadStatusFromFirebase(value);
+                          _subscribeToAlerts();
+                        }
                       },
                     ),
                   ),
@@ -286,20 +296,58 @@ class _NotificationsPageState extends ConsumerState<NotificationsPage> {
   void _subscribeToAlerts() {
     if (_selectedZoneId == null) return;
 
+    // Subscribe to alerts and also listen to read status changes
     DataService.subscribeToAlerts(_selectedZoneId!).listen((alerts) {
+      // Also fetch read status from Firebase
+      _loadReadStatusFromFirebase(_selectedZoneId!);
+      
       setState(() {
         _alertsByZone[_selectedZoneId!] = alerts;
-        // Initialize read status for new alerts
-        for (var alert in alerts) {
-          if (!_readAlerts.containsKey(alert.id)) {
-            _readAlerts[alert.id] = false;
-          }
-        }
       });
     });
   }
 
-  void _markAllAsRead() {
+  Future<void> _loadReadStatusFromFirebase(String zoneId) async {
+    try {
+      final database = FirebaseDatabase.instanceFor(
+        app: Firebase.app(),
+        databaseURL: FirebaseConfig.databaseURL,
+      ).ref();
+      
+      final snapshot = await database.child('alerts/$zoneId').get();
+      if (snapshot.exists) {
+        final alerts = Map<String, dynamic>.from(snapshot.value as Map);
+        setState(() {
+          for (var entry in alerts.entries) {
+            final alertData = Map<String, dynamic>.from(entry.value as Map);
+            final read = alertData['read'] as bool? ?? false;
+            _readAlerts[entry.key] = read;
+          }
+        });
+      }
+    } catch (e) {
+      print('⚠️ Failed to load read status from Firebase: $e');
+    }
+  }
+
+  Future<void> _markAllAsRead() async {
+    if (_selectedZoneId == null) return;
+    
+    // Mark all alerts as read in Firebase for the selected zone
+    await DataService.markAllAlertsAsRead(_selectedZoneId!);
+    
+    // Also mark all alerts as read for all zones of the current user
+    // This ensures the dashboard notification count updates correctly
+    try {
+      final user = AuthService.getCurrentUser();
+      if (user != null) {
+        await DataService.markAllAlertsAsReadForUser(user.uid);
+      }
+    } catch (e) {
+      print('⚠️ Failed to mark all alerts as read for user: $e');
+    }
+    
+    // Update local state immediately for better UX
     setState(() {
       for (var alertList in _alertsByZone.values) {
         for (var alert in alertList) {
@@ -309,7 +357,13 @@ class _NotificationsPageState extends ConsumerState<NotificationsPage> {
     });
   }
 
-  void _markAsRead(String alertId) {
+  Future<void> _markAsRead(String alertId) async {
+    if (_selectedZoneId == null) return;
+    
+    // Mark alert as read in Firebase
+    await DataService.markAlertAsRead(_selectedZoneId!, alertId);
+    
+    // Update local state immediately for better UX
     setState(() {
       _readAlerts[alertId] = true;
     });
@@ -345,17 +399,23 @@ class _NotificationsPageState extends ConsumerState<NotificationsPage> {
       final user = AuthService.getCurrentUser();
       if (user != null) {
         final zones = await DataService.getUserZones(user.uid);
-        final activeCameraId = ref.read(activeCameraProvider);
+        final activeCameras = ref.read(activeCameraProvider);
+        final activeCameraId = activeCameras.isNotEmpty ? activeCameras.first : null;
 
         setState(() {
           _zones = zones;
           if (zones.isNotEmpty) {
             // Use active camera if set, otherwise use first zone
             _selectedZoneId = activeCameraId ?? zones.first.id;
-            _subscribeToAlerts();
           }
           _isLoading = false;
         });
+        
+        // Load read status and subscribe to alerts after state is set
+        if (_selectedZoneId != null) {
+          await _loadReadStatusFromFirebase(_selectedZoneId!);
+          _subscribeToAlerts();
+        }
       }
     } catch (e) {
       setState(() {
@@ -444,6 +504,16 @@ class _NotificationsPageState extends ConsumerState<NotificationsPage> {
                 ],
               ),
               const SizedBox(height: 12),
+              // Notification message
+              Text(
+                alert.message,
+                style: TextStyle(
+                  fontSize: 14,
+                  color: AppTheme.foreground,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+              const SizedBox(height: 12),
               Row(
                 children: [
                   Icon(Icons.people, size: 16, color: AppTheme.mutedForeground),
@@ -515,6 +585,7 @@ class _NotificationsPageState extends ConsumerState<NotificationsPage> {
               ),
               const SizedBox(height: 16),
               _buildDetailRow('Zone', alert.zoneName),
+              _buildDetailRow('Message', alert.message),
               _buildDetailRow('Timestamp', _formatFullTime(alert.timestamp)),
               _buildDetailRow('People Count', '${alert.peopleCount}'),
               _buildDetailRow('Level', alert.level.toUpperCase()),

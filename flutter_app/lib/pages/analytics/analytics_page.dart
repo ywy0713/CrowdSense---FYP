@@ -6,6 +6,7 @@ import '../../theme/app_theme.dart';
 import '../../components/bottom_nav.dart';
 import '../../providers/active_camera_provider.dart';
 import 'package:fl_chart/fl_chart.dart';
+import 'summary_report_dialog.dart';
 
 class AnalyticsPage extends ConsumerStatefulWidget {
   const AnalyticsPage({super.key});
@@ -31,7 +32,8 @@ class _AnalyticsPageState extends ConsumerState<AnalyticsPage> {
   @override
   Widget build(BuildContext context) {
     // Watch active camera provider
-    final activeCameraId = ref.watch(activeCameraProvider);
+    final activeCameras = ref.watch(activeCameraProvider);
+    final activeCameraId = activeCameras.isNotEmpty ? activeCameras.first : null;
     
     // Update selected zone if active camera changed
     if (activeCameraId != null && activeCameraId != _selectedZoneId) {
@@ -57,7 +59,8 @@ class _AnalyticsPageState extends ConsumerState<AnalyticsPage> {
       final user = AuthService.getCurrentUser();
       if (user != null) {
         final zones = await DataService.getUserZones(user.uid);
-        final activeCameraId = ref.read(activeCameraProvider);
+        final activeCameras = ref.read(activeCameraProvider);
+        final activeCameraId = activeCameras.isNotEmpty ? activeCameras.first : null;
         
         setState(() {
           _zones = zones;
@@ -175,11 +178,39 @@ class _AnalyticsPageState extends ConsumerState<AnalyticsPage> {
                             },
                           ),
                           const SizedBox(height: 16),
-                          OutlinedButton.icon(
-                            onPressed: _selectDateRange,
-                            icon: const Icon(Icons.calendar_today),
-                            label: Text(
-                              '${_formatDate(_startDate)} - ${_formatDate(_endDate)}',
+                          Row(
+                            children: [
+                              Expanded(
+                                child: OutlinedButton.icon(
+                                  onPressed: _selectDateRange,
+                                  icon: const Icon(Icons.calendar_today),
+                                  label: Text(
+                                    '${_formatDate(_startDate)} - ${_formatDate(_endDate)}',
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 12),
+                          SizedBox(
+                            width: double.infinity,
+                            child: ElevatedButton.icon(
+                              onPressed: _analyticsData.isEmpty ? null : _generateSummaryReport,
+                              icon: const Icon(Icons.summarize),
+                              label: Text(_analyticsData.isEmpty 
+                                ? 'Generate Summary Report (No Data)' 
+                                : 'Generate Summary Report'),
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: _analyticsData.isEmpty 
+                                  ? AppTheme.muted 
+                                  : AppTheme.primary,
+                                foregroundColor: _analyticsData.isEmpty 
+                                  ? AppTheme.mutedForeground 
+                                  : Colors.white,
+                                padding: const EdgeInsets.symmetric(vertical: 16),
+                                disabledBackgroundColor: AppTheme.muted,
+                                disabledForegroundColor: AppTheme.mutedForeground,
+                              ),
                             ),
                           ),
                         ],
@@ -408,5 +439,150 @@ class _AnalyticsPageState extends ConsumerState<AnalyticsPage> {
 
   String _formatDate(DateTime date) {
     return '${date.month}/${date.day}/${date.year}';
+  }
+
+  Future<void> _generateSummaryReport() async {
+    if (_selectedZoneId == null || _analyticsData.isEmpty) return;
+
+    // Show loading dialog
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => const Center(child: CircularProgressIndicator()),
+    );
+
+    try {
+      // Get zone data
+      final zone = _zones.firstWhere((z) => z.id == _selectedZoneId);
+      
+      // Get alerts in the date range
+      final alerts = await DataService.getAlertsInRange(
+        _selectedZoneId!,
+        _startDate.millisecondsSinceEpoch,
+        _endDate.millisecondsSinceEpoch,
+      );
+
+      // Find peak time
+      CountSnapshot? peakSnapshot;
+      if (_analyticsData.isNotEmpty) {
+        peakSnapshot = _analyticsData.reduce((a, b) => a.count > b.count ? a : b);
+      }
+
+      // Filter alerts by level
+      final criticalAlerts = alerts.where((a) => a.level == 'critical').toList();
+      final highAlerts = alerts.where((a) => a.level == 'high').toList();
+
+      // Calculate total people count
+      final totalPeople = _analyticsData.map((e) => e.count).reduce((a, b) => a + b);
+
+      // Generate recommendation
+      final recommendation = _generateRecommendation(
+        peakSnapshot,
+        criticalAlerts,
+        highAlerts,
+        zone.thresholds,
+      );
+
+      // Create report
+      final report = SummaryReport(
+        zoneName: zone.name,
+        startDate: _startDate,
+        endDate: _endDate,
+        peakTime: peakSnapshot != null ? DateTime.fromMillisecondsSinceEpoch(peakSnapshot.timestamp) : null,
+        peakCount: peakSnapshot?.count ?? 0,
+        criticalAlerts: criticalAlerts,
+        highAlerts: highAlerts,
+        totalPeople: totalPeople,
+        analyticsData: _analyticsData,
+        thresholds: zone.thresholds,
+        recommendation: recommendation,
+        averageServiceSpeed: zone.averageServiceSpeed,
+      );
+
+      // Close loading dialog
+      if (mounted) {
+        Navigator.of(context).pop();
+        
+        // Show report dialog
+        showDialog(
+          context: context,
+          builder: (context) => SummaryReportDialog(report: report),
+        );
+      }
+    } catch (e) {
+      // Close loading dialog
+      if (mounted) {
+        Navigator.of(context).pop();
+        
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Failed to generate report: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+  }
+
+  String _generateRecommendation(
+    CountSnapshot? peakSnapshot,
+    List<AlertLog> criticalAlerts,
+    List<AlertLog> highAlerts,
+    ZoneThresholds thresholds,
+  ) {
+    final recommendations = <String>[];
+
+    // Peak time recommendation
+    if (peakSnapshot != null) {
+      final peakTime = DateTime.fromMillisecondsSinceEpoch(peakSnapshot.timestamp);
+      final hour = peakTime.hour;
+      String timeOfDay;
+      if (hour >= 6 && hour < 12) {
+        timeOfDay = 'morning';
+      } else if (hour >= 12 && hour < 18) {
+        timeOfDay = 'afternoon';
+      } else if (hour >= 18 && hour < 22) {
+        timeOfDay = 'evening';
+      } else {
+        timeOfDay = 'night';
+      }
+      
+      recommendations.add(
+        'Peak crowd occurs during $timeOfDay hours (${peakTime.hour}:${peakTime.minute.toString().padLeft(2, '0')}) with ${peakSnapshot.count} people. Consider increasing staff during this period.',
+      );
+    }
+
+    // Critical alerts recommendation
+    if (criticalAlerts.isNotEmpty) {
+      final criticalTimes = criticalAlerts.map((a) {
+        final dt = DateTime.fromMillisecondsSinceEpoch(a.timestamp);
+        return '${dt.hour}:${dt.minute.toString().padLeft(2, '0')}';
+      }).toSet().toList();
+      
+      recommendations.add(
+        'Critical threshold was reached ${criticalAlerts.length} time(s) at: ${criticalTimes.join(', ')}. Immediate action required during these times.',
+      );
+    }
+
+    // High alerts recommendation
+    if (highAlerts.isNotEmpty && criticalAlerts.isEmpty) {
+      final highTimes = highAlerts.map((a) {
+        final dt = DateTime.fromMillisecondsSinceEpoch(a.timestamp);
+        return '${dt.hour}:${dt.minute.toString().padLeft(2, '0')}';
+      }).toSet().toList();
+      
+      recommendations.add(
+        'High threshold was reached ${highAlerts.length} time(s) at: ${highTimes.join(', ')}. Consider proactive management during these periods.',
+      );
+    }
+
+    // General recommendation
+    if (recommendations.isEmpty) {
+      recommendations.add(
+        'No significant congestion events detected during this period. Current staffing levels appear adequate.',
+      );
+    }
+
+    return recommendations.join('\n\n');
   }
 }

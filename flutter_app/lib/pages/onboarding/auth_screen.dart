@@ -90,6 +90,13 @@ class _AuthScreenState extends ConsumerState<AuthScreen> {
     
     // If we get here, Firebase didn't initialize in time
     // But we'll still allow the user to try logging in (AuthService will handle initialization)
+    // Set ready anyway to show UI (Firebase might initialize later)
+    if (mounted) {
+      setState(() {
+        _isFirebaseReady = true;
+      });
+    }
+    print('⚠️ Firebase initialization timeout, but showing UI anyway');
     if (mounted) {
       setState(() {
         _isFirebaseReady = true; // Allow login attempt anyway

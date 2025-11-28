@@ -112,8 +112,8 @@ class _CameraListPageState extends ConsumerState<CameraListPage> {
     // Python service handles camera access directly on the backend
     // Flutter app just displays the stream from Python service
 
-    // Set as active camera
-    ref.read(activeCameraProvider.notifier).setActiveCamera(zone.id);
+    // Add to active cameras
+    ref.read(activeCameraProvider.notifier).addActiveCamera(zone.id);
 
     // Start Python AI service
     try {
@@ -266,10 +266,10 @@ class _CameraListPageState extends ConsumerState<CameraListPage> {
                 // Delete zone from database
                 await DataService.deleteZone(user.uid, zoneId);
                 
-                // If this was the active camera, clear it
-                final activeCamera = ref.read(activeCameraProvider);
-                if (activeCamera == zoneId) {
-                  ref.read(activeCameraProvider.notifier).clearActiveCamera();
+                // If this was an active camera, remove it
+                final activeCameras = ref.read(activeCameraProvider);
+                if (activeCameras.contains(zoneId)) {
+                  ref.read(activeCameraProvider.notifier).removeActiveCamera(zoneId);
                 }
                 
                 // Immediately remove from local list for instant UI update
@@ -323,7 +323,8 @@ class _CameraListPageState extends ConsumerState<CameraListPage> {
 
   @override
   Widget build(BuildContext context) {
-    final activeCameraId = ref.watch(activeCameraProvider);
+    final activeCameras = ref.watch(activeCameraProvider);
+    final activeCameraId = activeCameras.isNotEmpty ? activeCameras.first : null;
 
     return Scaffold(
       appBar: AppBar(

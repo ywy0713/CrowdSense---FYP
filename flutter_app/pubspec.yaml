@@ -59,6 +59,9 @@ dependencies:
   
   # Audio playback for notifications
   audioplayers: ^6.1.0
+  
+  # File sharing
+  share_plus: ^10.1.2
 
 dev_dependencies:
   flutter_test:

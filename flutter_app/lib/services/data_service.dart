@@ -118,6 +118,7 @@ class AlertLog {
   final int peopleCount;
   final String level; // 'low' | 'medium' | 'high' | 'critical'
   final int waitingTimeMin;
+  final String message; // Notification message text
   final String? screenshotUrl;
   final String? screenshotBase64;
 
@@ -129,6 +130,7 @@ class AlertLog {
     required this.peopleCount,
     required this.level,
     required this.waitingTimeMin,
+    required this.message,
     this.screenshotUrl,
     this.screenshotBase64,
   });
@@ -142,20 +144,36 @@ class AlertLog {
       'peopleCount': peopleCount,
       'level': level,
       'waitingTimeMin': waitingTimeMin,
+      'message': message,
       if (screenshotUrl != null) 'screenshotUrl': screenshotUrl,
       if (screenshotBase64 != null) 'screenshotBase64': screenshotBase64,
     };
   }
 
   factory AlertLog.fromMap(String id, Map<dynamic, dynamic> map) {
+    // Get peopleCount - support both 'peopleCount' and 'count' for backward compatibility
+    final peopleCount = map['peopleCount'] ?? map['count'] ?? 0;
+    
+    // Get waitingTimeMin - if not present, default to 0
+    final waitingTimeMin = map['waitingTimeMin'] ?? 0;
+    
+    // Get message - if not present, generate a default message based on level
+    String message = map['message'] ?? '';
+    if (message.isEmpty) {
+      final level = map['level'] ?? 'threshold';
+      final levelText = level == 'critical' ? 'Critical' : (level == 'high' ? 'High' : (level == 'medium' ? 'Medium' : (level == 'low' ? 'Low' : level)));
+      message = 'People count has reached $levelText threshold!';
+    }
+    
     return AlertLog(
       id: id,
       zoneId: map['zoneId'] ?? '',
       zoneName: map['zoneName'] ?? '',
       timestamp: map['timestamp'] ?? 0,
-      peopleCount: map['peopleCount'] ?? 0,
+      peopleCount: peopleCount,
       level: map['level'] ?? 'low',
-      waitingTimeMin: map['waitingTimeMin'] ?? 0,
+      waitingTimeMin: waitingTimeMin,
+      message: message,
       screenshotUrl: map['screenshotUrl'],
       screenshotBase64: map['screenshotBase64'],
     );
@@ -355,5 +373,79 @@ class DataService {
       }).toList()
         ..sort((a, b) => b.timestamp.compareTo(a.timestamp));
     });
+  }
+
+  // Mark alert as read
+  static Future<void> markAlertAsRead(String zoneId, String alertId) async {
+    try {
+      await _database.child('alerts/$zoneId/$alertId').update({
+        'read': true,
+      });
+      print('✅ Alert marked as read: zone=$zoneId, alert=$alertId');
+    } catch (e) {
+      print('⚠️ Failed to mark alert as read: $e');
+    }
+  }
+
+  // Mark all alerts as read for a zone
+  static Future<void> markAllAlertsAsRead(String zoneId) async {
+    try {
+      final snapshot = await _database.child('alerts/$zoneId').get();
+      if (snapshot.exists) {
+        final alerts = Map<String, dynamic>.from(snapshot.value as Map);
+        final updates = <String, dynamic>{};
+        for (var alertId in alerts.keys) {
+          updates['alerts/$zoneId/$alertId/read'] = true;
+        }
+        if (updates.isNotEmpty) {
+          await _database.update(updates);
+          print('✅ All alerts marked as read for zone: $zoneId (${updates.length} alerts)');
+        }
+      }
+    } catch (e) {
+      print('⚠️ Failed to mark all alerts as read: $e');
+    }
+  }
+
+  // Mark all alerts as read for all zones of a user
+  static Future<void> markAllAlertsAsReadForUser(String userId) async {
+    try {
+      final zones = await getUserZones(userId);
+      for (var zone in zones) {
+        await markAllAlertsAsRead(zone.id);
+      }
+      print('✅ All alerts marked as read for user: $userId');
+    } catch (e) {
+      print('⚠️ Failed to mark all alerts as read for user: $e');
+    }
+  }
+
+  // Get alerts for a specific time range
+  static Future<List<AlertLog>> getAlertsInRange(
+    String zoneId,
+    int startTime,
+    int endTime,
+  ) async {
+    try {
+      final snapshot = await _database.child('alerts/$zoneId').get();
+      if (!snapshot.exists) return [];
+
+      final alerts = Map<String, dynamic>.from(snapshot.value as Map);
+      final filtered = <AlertLog>[];
+
+      for (final entry in alerts.entries) {
+        final alertData = Map<String, dynamic>.from(entry.value as Map);
+        final timestamp = alertData['timestamp'] as int? ?? 0;
+        if (timestamp >= startTime && timestamp <= endTime) {
+          filtered.add(AlertLog.fromMap(entry.key, alertData));
+        }
+      }
+
+      filtered.sort((a, b) => a.timestamp.compareTo(b.timestamp));
+      return filtered;
+    } catch (e) {
+      print('⚠️ Failed to get alerts in range: $e');
+      return [];
+    }
   }
 }

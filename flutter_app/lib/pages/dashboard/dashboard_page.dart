@@ -34,9 +34,10 @@ class _DashboardPageState extends ConsumerState<DashboardPage> {
   String? _errorMessage;
   String? _selectedZoneId;
   int _unreadNotificationCount = 0;
-  StreamSubscription? _notificationSubscription;
+  Map<String, StreamSubscription> _notificationSubscriptions = {}; // Store subscriptions for each zone
   final AudioPlayer _audioPlayer = AudioPlayer();
   Map<String, String?> _lastThresholdLevel = {}; // Track last threshold level for each zone to avoid duplicate alerts
+  Map<String, int> _zoneUnreadCounts = {}; // Track unread count per zone (instance variable)
 
   @override
   void initState() {
@@ -147,7 +148,11 @@ class _DashboardPageState extends ConsumerState<DashboardPage> {
       subscription?.cancel();
     }
     _apiPollingSubscriptions.clear();
-    _notificationSubscription?.cancel();
+    // Cancel all notification subscriptions
+    for (var subscription in _notificationSubscriptions.values) {
+      subscription.cancel();
+    }
+    _notificationSubscriptions.clear();
     _audioPlayer.dispose();
     super.dispose();
   }
@@ -385,7 +390,11 @@ class _DashboardPageState extends ConsumerState<DashboardPage> {
   }
 
   void _subscribeToNotifications(List<ZoneData> zones) {
-    _notificationSubscription?.cancel();
+    // Cancel all existing subscriptions
+    for (var subscription in _notificationSubscriptions.values) {
+      subscription.cancel();
+    }
+    _notificationSubscriptions.clear();
     
     if (zones.isEmpty) {
       setState(() {
@@ -405,38 +414,46 @@ class _DashboardPageState extends ConsumerState<DashboardPage> {
       _unreadNotificationCount = 0;
     });
 
+    // Track unread count across all zones using instance variable
+    _zoneUnreadCounts.clear();
+    
     for (var zone in zones) {
       final subscription = database.child('alerts/${zone.id}').onValue.listen((event) {
-        if (mounted && event.snapshot.exists) {
-          final alerts = event.snapshot.value as Map<dynamic, dynamic>?;
-          if (alerts != null) {
-            // Count recent alerts (within last 24 hours)
-            final now = DateTime.now().millisecondsSinceEpoch;
-            final oneDayAgo = now - (24 * 60 * 60 * 1000);
-            
-            int count = 0;
-            alerts.forEach((key, value) {
-              final alert = value as Map<dynamic, dynamic>;
-              final timestamp = alert['timestamp'] as int? ?? 0;
-              if (timestamp > oneDayAgo) {
-                count++;
-              }
-            });
-            
-            // Update count for this zone (in a real implementation, we'd track per-zone)
-            if (mounted) {
-              setState(() {
-                // Simple count - in production, you'd want to track per zone and sum
-                _unreadNotificationCount = count; // For now, show count from first zone
+        if (mounted) {
+          int unreadCount = 0;
+          
+          if (event.snapshot.exists) {
+            final alerts = event.snapshot.value as Map<dynamic, dynamic>?;
+            if (alerts != null) {
+              // Count recent unread alerts (within last 24 hours)
+              final now = DateTime.now().millisecondsSinceEpoch;
+              final oneDayAgo = now - (24 * 60 * 60 * 1000);
+              
+              alerts.forEach((key, value) {
+                final alert = value as Map<dynamic, dynamic>;
+                final timestamp = alert['timestamp'] as int? ?? 0;
+                final read = alert['read'] as bool? ?? false;
+                // Only count unread alerts within last 24 hours
+                if (timestamp > oneDayAgo && !read) {
+                  unreadCount++;
+                }
               });
             }
           }
+          
+          // Update count for this zone (using instance variable)
+          _zoneUnreadCounts[zone.id] = unreadCount;
+          
+          // Calculate total unread count across all zones
+          final totalUnreadCount = _zoneUnreadCounts.values.fold(0, (sum, count) => sum + count);
+          setState(() {
+            _unreadNotificationCount = totalUnreadCount;
+          });
         }
       });
       
-      // Store subscription for this zone (in a real implementation)
-      // For now, we just use the last subscription
-      _notificationSubscription = subscription;
+      // Store subscription for this zone (important: store all, not just the last one)
+      _notificationSubscriptions[zone.id] = subscription;
     }
   }
 
@@ -455,6 +472,25 @@ class _DashboardPageState extends ConsumerState<DashboardPage> {
     if ((currentLevel == 'high' || currentLevel == 'critical') && currentLevel != lastLevel) {
       _lastThresholdLevel[zoneId] = currentLevel;
       
+      // Find zone to get averageServiceSpeed for waiting time calculation
+      final zone = _zones.firstWhere((z) => z.id == zoneId, orElse: () => ZoneData(
+        id: zoneId,
+        name: zoneName,
+        peopleCount: count,
+        lastUpdated: DateTime.now().millisecondsSinceEpoch,
+        thresholds: thresholds,
+        cameraUrl: null,
+        rtspUrl: null,
+        averageServiceSpeed: null,
+      ));
+      
+      // Calculate waiting time
+      final waitingTimeMin = _calculateWaitingTime(count, zone.averageServiceSpeed).round();
+      
+      // Generate notification message
+      final levelText = currentLevel == 'critical' ? 'Critical' : 'High';
+      final message = 'People count has reached $levelText threshold!';
+      
       // Play sound notification
       _playNotificationSound();
       
@@ -466,8 +502,8 @@ class _DashboardPageState extends ConsumerState<DashboardPage> {
       // Show modal alert
       _showThresholdAlertModal(zoneName, count, currentLevel, thresholds);
       
-      // Save alert to Firebase
-      _saveAlertToFirebase(zoneId, count, currentLevel);
+      // Save alert to Firebase with all required data
+      _saveAlertToFirebase(zoneId, count, currentLevel, zoneName, waitingTimeMin, message);
     } else if (currentLevel != 'high' && currentLevel != 'critical') {
       // Reset last level when count drops below high/critical
       _lastThresholdLevel[zoneId] = currentLevel;
@@ -580,7 +616,7 @@ class _DashboardPageState extends ConsumerState<DashboardPage> {
     );
   }
 
-  Future<void> _saveAlertToFirebase(String zoneId, int count, String level) async {
+  Future<void> _saveAlertToFirebase(String zoneId, int count, String level, String zoneName, int waitingTimeMin, String message) async {
     try {
       final database = FirebaseDatabase.instanceFor(
         app: Firebase.app(),
@@ -590,13 +626,16 @@ class _DashboardPageState extends ConsumerState<DashboardPage> {
       final alertRef = database.child('alerts/$zoneId').push();
       await alertRef.set({
         'zoneId': zoneId,
-        'count': count,
+        'zoneName': zoneName,
+        'peopleCount': count, // Use 'peopleCount' instead of 'count' to match AlertLog
         'level': level,
+        'waitingTimeMin': waitingTimeMin,
+        'message': message,
         'timestamp': DateTime.now().millisecondsSinceEpoch,
         'read': false,
       });
       
-      print('✅ Alert saved to Firebase: zone=$zoneId, count=$count, level=$level');
+      print('✅ Alert saved to Firebase: zone=$zoneId, zoneName=$zoneName, count=$count, level=$level, waitingTime=$waitingTimeMin min, message=$message');
     } catch (e) {
       print('⚠️ Failed to save alert to Firebase: $e');
     }
@@ -720,7 +759,8 @@ class _DashboardPageState extends ConsumerState<DashboardPage> {
   @override
   Widget build(BuildContext context) {
     // Use active camera from provider, or fallback to selected zone
-    final activeCameraId = ref.watch(activeCameraProvider);
+    final activeCameras = ref.watch(activeCameraProvider);
+    final activeCameraId = activeCameras.isNotEmpty ? activeCameras.first : null;
     final activeZoneId = activeCameraId ?? _selectedZoneId;
     
     final selectedZone = _zones.firstWhere(
@@ -754,21 +794,6 @@ class _DashboardPageState extends ConsumerState<DashboardPage> {
             onPressed: _loadZones,
             tooltip: 'Refresh',
           ),
-          if (_zones.length > 1)
-            PopupMenuButton<String>(
-              icon: const Icon(Icons.more_vert),
-              onSelected: (zoneId) {
-                setState(() {
-                  _selectedZoneId = zoneId;
-                });
-              },
-              itemBuilder: (context) => _zones.map((zone) {
-                return PopupMenuItem(
-                  value: zone.id,
-                  child: Text(zone.name),
-                );
-              }).toList(),
-            ),
         ],
       ),
       bottomNavigationBar: const BottomNav(currentIndex: 0),
@@ -820,6 +845,29 @@ class _DashboardPageState extends ConsumerState<DashboardPage> {
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
+                            // Zone selector (same design as analytics page)
+                            if (_zones.length > 1)
+                              Padding(
+                                padding: const EdgeInsets.only(bottom: 16),
+                                child: DropdownButtonFormField<String>(
+                                  value: _selectedZoneId,
+                                  decoration: const InputDecoration(
+                                    labelText: 'Select Zone',
+                                    border: OutlineInputBorder(),
+                                  ),
+                                  items: _zones.map((zone) {
+                                    return DropdownMenuItem(
+                                      value: zone.id,
+                                      child: Text(zone.name),
+                                    );
+                                  }).toList(),
+                                  onChanged: (value) {
+                                    setState(() {
+                                      _selectedZoneId = value;
+                                    });
+                                  },
+                                ),
+                              ),
                             // WAITING ZONE Card (matches image design)
                             _buildWaitingZoneCard(selectedZone),
                             const SizedBox(height: 16),
