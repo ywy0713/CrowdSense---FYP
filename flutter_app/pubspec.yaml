@@ -54,7 +54,10 @@ dependencies:
   # Image Processing
   image: ^4.3.0
   
-  # WebView for displaying MJPEG streams
+  # ML Kit for person detection
+  google_mlkit_object_detection: ^0.11.0
+  
+  # WebView for displaying MJPEG streams (for external camera HTTP)
   webview_flutter: ^4.9.0
   
   # Audio playback for notifications
@@ -71,6 +74,8 @@ dev_dependencies:
 flutter:
   uses-material-design: true
 
-  assets:
-    - assets/images/
-    - assets/icons/
+  # Assets removed - directories don't exist
+  # If you need to add assets later, create the directories and uncomment:
+  # assets:
+  #   - assets/images/
+  #   - assets/icons/

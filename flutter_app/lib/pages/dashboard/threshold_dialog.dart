@@ -38,12 +38,40 @@ class _ThresholdDialogState extends State<ThresholdDialog> {
 
   Future<void> _saveThresholds() async {
     try {
+      final low = int.tryParse(_lowController.text) ?? widget.zone.thresholds.low;
+      final medium = int.tryParse(_mediumController.text) ?? widget.zone.thresholds.medium;
+      final high = int.tryParse(_highController.text) ?? widget.zone.thresholds.high;
+      final critical = int.tryParse(_criticalController.text) ?? widget.zone.thresholds.critical;
+
+      // Validate that thresholds are in strictly increasing order
+      String? errorMessage;
+      if (medium <= low) {
+        errorMessage = 'Medium threshold must be greater than Low threshold.';
+      } else if (high <= medium) {
+        errorMessage = 'High threshold must be greater than Medium threshold.';
+      } else if (critical <= high) {
+        errorMessage = 'Critical threshold must be greater than High threshold.';
+      }
+
+      if (errorMessage != null) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(errorMessage),
+              backgroundColor: Colors.red,
+              duration: const Duration(seconds: 3),
+            ),
+          );
+        }
+        return;
+      }
+
       final thresholds = {
         'thresholds': {
-          'low': int.tryParse(_lowController.text) ?? widget.zone.thresholds.low,
-          'medium': int.tryParse(_mediumController.text) ?? widget.zone.thresholds.medium,
-          'high': int.tryParse(_highController.text) ?? widget.zone.thresholds.high,
-          'critical': int.tryParse(_criticalController.text) ?? widget.zone.thresholds.critical,
+          'low': low,
+          'medium': medium,
+          'high': high,
+          'critical': critical,
         },
       };
 

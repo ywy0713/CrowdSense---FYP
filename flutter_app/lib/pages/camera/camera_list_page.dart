@@ -6,6 +6,9 @@ import 'package:http/http.dart' as http;
 import '../../services/auth_service.dart';
 import '../../services/data_service.dart';
 import '../../services/ai_service.dart';
+import '../../services/local_camera_service.dart';
+import '../../services/local_ai_service.dart';
+import '../../services/firebase_monitoring_service.dart';
 import '../../theme/app_theme.dart';
 import '../../providers/active_camera_provider.dart';
 import '../../components/bottom_nav.dart';
@@ -79,85 +82,196 @@ class _CameraListPageState extends ConsumerState<CameraListPage> {
     }
   }
 
-  // Check monitoring status from API
+  // Check monitoring status from Firebase (for local mode) and Python API (for HTTP mode)
   Future<void> _checkMonitoringStatus(String zoneId) async {
+    bool isMonitoring = false;
+    
+    // First check Firebase monitoring status (works for both local and HTTP modes)
     try {
-      final baseUrl = AIService.baseUrl;
-      final url = '$baseUrl/zones/$zoneId/count';
-      
-      final response = await http.get(
-        Uri.parse(url),
-      ).timeout(const Duration(seconds: 3));
-      
-      if (response.statusCode == 200 && mounted) {
-        final data = jsonDecode(response.body);
-        final isMonitoring = data['is_monitoring'] as bool? ?? false;
-        
-        setState(() {
-          _zoneMonitoringStatus[zoneId] = isMonitoring;
-        });
-      }
+      isMonitoring = await FirebaseMonitoringService.getMonitoringStatus(zoneId);
     } catch (e) {
-      // If API call fails, assume not monitoring
-      if (mounted) {
-        setState(() {
-          _zoneMonitoringStatus[zoneId] = false;
-        });
+      print('⚠️ Failed to check Firebase monitoring status for $zoneId: $e');
+    }
+    
+    // Also check Python service status (for HTTP mode)
+    if (!isMonitoring) {
+      try {
+        final baseUrl = AIService.baseUrl;
+        final url = '$baseUrl/zones/$zoneId/count';
+        
+        final response = await http.get(
+          Uri.parse(url),
+        ).timeout(const Duration(seconds: 3));
+        
+        if (response.statusCode == 200) {
+          final data = jsonDecode(response.body);
+          isMonitoring = data['is_monitoring'] as bool? ?? false;
+        }
+      } catch (e) {
+        // Python service might not be available for local mode, that's OK
+        print('⚠️ Python service check failed for $zoneId (this is OK for local mode): $e');
       }
+    }
+    
+    // Update state
+    if (mounted) {
+      setState(() {
+        _zoneMonitoringStatus[zoneId] = isMonitoring;
+      });
     }
   }
 
   Future<void> _activateCamera(ZoneData zone) async {
-    // Simplified: No permission dialog needed
-    // Python service handles camera access directly on the backend
-    // Flutter app just displays the stream from Python service
+    // Check if using local mode or HTTP mode
+    // 'local' mode uses Flutter camera package to access device camera
+    // 'http' mode uses Python service to access computer camera via HTTP stream
+    final isLocalMode = zone.cameraUrl == 'local';
+    final isHttpMode = zone.cameraUrl != null && zone.cameraUrl!.startsWith('http');
 
     // Add to active cameras
     ref.read(activeCameraProvider.notifier).addActiveCamera(zone.id);
 
-    // Start Python AI service
-    try {
-      if (mounted) {
-        showDialog(
-          context: context,
-          barrierDismissible: false,
-          builder: (context) => const Center(
-            child: Card(
-              child: Padding(
-                padding: EdgeInsets.all(24),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    CircularProgressIndicator(),
-                    SizedBox(height: 16),
-                    Text('Starting camera and AI service...'),
-                  ],
+    if (isLocalMode) {
+      // Local mode - use device camera directly via Flutter camera package
+      try {
+        if (mounted) {
+          showDialog(
+            context: context,
+            barrierDismissible: false,
+            builder: (context) => const Center(
+              child: Card(
+                child: Padding(
+                  padding: EdgeInsets.all(24),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      CircularProgressIndicator(),
+                      SizedBox(height: 16),
+                      Text('Starting local camera...'),
+                    ],
+                  ),
                 ),
               ),
             ),
-          ),
-        );
-      }
+          );
+        }
 
-      bool started = false;
-      try {
-        started = await AIService.startZoneMonitoring(zone.id, zone);
-      } catch (e) {
-        print('❌ Exception during startZoneMonitoring: $e');
-        // Continue to show error message
-      }
-
-      if (!mounted) return;
-
-      Navigator.of(context).pop(); // Dismiss loading dialog
-
-      if (started) {
-        // Reload zones to update status
-        _loadZones();
+        // Initialize local camera
+        final cameraInitialized = await LocalCameraService.initialize();
         
-        // Automatically navigate to surveillance page
+        if (!mounted) return;
+        Navigator.of(context).pop(); // Dismiss loading dialog
+
+        if (cameraInitialized) {
+          // Update monitoring status in Firebase
+          await FirebaseMonitoringService.setMonitoringStatus(zone.id, true);
+          
+          // Update local state immediately
+          setState(() {
+            _zoneMonitoringStatus[zone.id] = true;
+          });
+          
+          // Reload zones to update status and refresh UI
+          await _loadZones();
+          
+          // Double-check Firebase status to ensure consistency
+          await _checkMonitoringStatus(zone.id);
+          
+          // Navigate to surveillance page
+          if (mounted) {
+            await Future.delayed(const Duration(milliseconds: 500));
+            if (mounted) {
+              context.go('/surveillance');
+            }
+          }
+          
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text('✅ Camera "${zone.name}" activated (Local Mode)!'),
+                backgroundColor: Colors.green,
+                duration: const Duration(seconds: 2),
+              ),
+            );
+          }
+        } else {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('❌ Failed to initialize local camera. Please check camera permissions.'),
+              backgroundColor: Colors.red,
+            ),
+          );
+        }
+      } catch (e) {
         if (mounted) {
-          // Small delay to ensure service is ready
+          Navigator.of(context).pop(); // Dismiss loading dialog
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('❌ Error starting local camera: $e'),
+              backgroundColor: Colors.red,
+            ),
+          );
+        }
+      }
+    } else if (isHttpMode) {
+      // HTTP mode - use Python service to access computer camera
+      try {
+        if (mounted) {
+          showDialog(
+            context: context,
+            barrierDismissible: false,
+            builder: (context) => Center(
+              child: Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const CircularProgressIndicator(),
+                      const SizedBox(height: 16),
+                      const Text('Connecting to HTTP camera...'),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          );
+        }
+
+        // For HTTP mode, start Python service monitoring
+        // This ensures proper camera resource management and people detection
+        final success = await AIService.startZoneMonitoring(zone.id, zone);
+        if (!mounted) return;
+        Navigator.of(context).pop(); // Dismiss loading dialog
+        
+        if (!success) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('❌ Failed to start Python service. Please ensure Python service is running.'),
+              backgroundColor: Colors.red,
+            ),
+          );
+          return;
+        }
+        
+        // Update monitoring status in Firebase
+        await FirebaseMonitoringService.setMonitoringStatus(zone.id, true);
+        
+        if (!mounted) return;
+        
+        // Update local state immediately
+        setState(() {
+          _zoneMonitoringStatus[zone.id] = true;
+        });
+        
+        // Reload zones to update status and refresh UI
+        await _loadZones();
+        
+        // Double-check Firebase status to ensure consistency
+        await _checkMonitoringStatus(zone.id);
+        
+        // Navigate to surveillance page
+        if (mounted) {
           await Future.delayed(const Duration(milliseconds: 500));
           if (mounted) {
             context.go('/surveillance');
@@ -167,49 +281,109 @@ class _CameraListPageState extends ConsumerState<CameraListPage> {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
-              content: Text('✅ Camera "${zone.name}" activated! Redirecting to live view...'),
+              content: Text('✅ Camera "${zone.name}" activated (HTTP Mode)!'),
               backgroundColor: Colors.green,
               duration: const Duration(seconds: 2),
             ),
           );
         }
-      } else {
-        // Show error but don't navigate - let user retry
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: const Text('⚠️ Warning: Could not start AI service. Make sure the Python service is running at http://localhost:8000. Please check the terminal/console for details.'),
-            backgroundColor: Colors.orange,
-            duration: const Duration(seconds: 6),
-            action: SnackBarAction(
-              label: 'OK',
-              textColor: Colors.white,
-              onPressed: () {
-                // Action handled by SnackBar dismissal
-              },
+      } catch (e) {
+        if (mounted) {
+          Navigator.of(context).pop(); // Dismiss loading dialog
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('❌ Error activating camera: $e'),
+              backgroundColor: Colors.red,
             ),
-          ),
-        );
+          );
+        }
       }
-    } catch (e) {
-      if (mounted) {
-        Navigator.of(context).pop(); // Dismiss loading dialog
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('❌ Error starting AI service: $e'),
-            backgroundColor: Colors.red,
-          ),
-        );
-      }
+    } else {
+      // Fallback - should not reach here
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('❌ Unknown camera mode'),
+          backgroundColor: Colors.red,
+        ),
+      );
     }
   }
 
+
   Future<void> _deactivateCamera(String zoneId) async {
     try {
-      // Stop Python AI service
-      await AIService.stopZoneMonitoring(zoneId);
+      // Get zone to check if it's local mode
+      final zone = _zones.firstWhere((z) => z.id == zoneId, orElse: () => _zones.first);
+      final isLocalMode = zone.cameraUrl == 'local';
+      final isHttpMode = zone.cameraUrl != null && zone.cameraUrl!.startsWith('http');
       
-      // Clear active camera
-      ref.read(activeCameraProvider.notifier).clearActiveCamera();
+      if (isLocalMode) {
+        // Local mode - dispose camera and update Firebase
+        await LocalCameraService.stopPreview();
+        await LocalCameraService.dispose();
+        LocalAIService.dispose();
+        await FirebaseMonitoringService.setMonitoringStatus(zoneId, false);
+      } else if (isHttpMode) {
+        // HTTP mode - stop Python AI service to release camera
+        try {
+          final success = await AIService.stopZoneMonitoring(zoneId);
+          if (!success) {
+            print('ℹ️ HTTP mode zone $zoneId may not have Python monitoring task (this is OK if using external stream)');
+          } else {
+            print('✅ Python service stopped successfully for zone $zoneId');
+          }
+        } catch (e) {
+          // Handle 404 error gracefully for HTTP mode (zone may not be in monitoring_tasks)
+          if (e.toString().contains('404')) {
+            print('ℹ️ HTTP mode zone $zoneId not in Python monitoring tasks (using external stream, this is OK)');
+          } else {
+            print('⚠️ Error stopping Python service: $e');
+          }
+        }
+        
+        // Check if using external camera server and stop it if no other zones are using it
+        // IMPORTANT: Don't stop external camera server immediately - it will be stopped
+        // by Python service's stop_monitoring endpoint if no zones are using it
+        // This prevents issues with rapid deactivate/activate cycles
+        if (AIService.isExternalCameraServerUrl(zone.cameraUrl)) {
+          try {
+            // Check if any other zones are using external camera server
+            // Check both Firebase and Python service status
+            final activeZones = await FirebaseMonitoringService.getActiveZones();
+            final otherZonesUsingExternal = activeZones.where((id) => id != zoneId).toList();
+            
+            // Also check Python service for active monitoring tasks
+            final pythonStatus = await AIService.getStatus();
+            final pythonActiveZones = pythonStatus?['active_zones'] as List<dynamic>? ?? [];
+            final pythonOtherZones = pythonActiveZones.where((id) => id.toString() != zoneId).toList();
+            
+            if (otherZonesUsingExternal.isEmpty && pythonOtherZones.isEmpty) {
+              // No other zones using external camera server, stop it
+              // But wait a bit to ensure monitoring task is fully stopped
+              await Future.delayed(const Duration(milliseconds: 500));
+              print('🛑 Stopping external camera server as no other zones are using it');
+              await AIService.stopExternalCameraServer();
+            } else {
+              print('ℹ️ Other zones are using external camera server, keeping it running');
+              print('   Firebase active zones: $otherZonesUsingExternal');
+              print('   Python active zones: $pythonOtherZones');
+            }
+          } catch (e) {
+            print('⚠️ Error checking/stopping external camera server: $e');
+            // Don't fail deactivation if external camera server check fails
+          }
+        }
+        
+        await FirebaseMonitoringService.setMonitoringStatus(zoneId, false);
+      }
+      
+      // Remove only this specific zone from active cameras
+      ref.read(activeCameraProvider.notifier).removeActiveCamera(zoneId);
+      
+      // Update monitoring status immediately
+      setState(() {
+        _zoneMonitoringStatus[zoneId] = false;
+      });
       
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -218,7 +392,8 @@ class _CameraListPageState extends ConsumerState<CameraListPage> {
             backgroundColor: Colors.green,
           ),
         );
-        _loadZones(); // Reload to update status
+        // Reload to refresh status from API
+        _loadZones();
       }
     } catch (e) {
       if (mounted) {
@@ -311,11 +486,9 @@ class _CameraListPageState extends ConsumerState<CameraListPage> {
   }
 
   String _getConnectionTypeDisplay(ZoneData zone) {
-    if (zone.cameraUrl == 'direct') {
-      return 'Direct Camera';
-    } else if (zone.rtspUrl != null && zone.rtspUrl!.isNotEmpty) {
-      return 'RTSP Stream';
-    } else if (zone.cameraUrl != null && zone.cameraUrl!.isNotEmpty) {
+    if (zone.cameraUrl == 'local') {
+      return 'Local Camera';
+    } else if (zone.cameraUrl != null && zone.cameraUrl!.startsWith('http')) {
       return 'HTTP Stream';
     }
     return 'Unknown';
@@ -324,7 +497,6 @@ class _CameraListPageState extends ConsumerState<CameraListPage> {
   @override
   Widget build(BuildContext context) {
     final activeCameras = ref.watch(activeCameraProvider);
-    final activeCameraId = activeCameras.isNotEmpty ? activeCameras.first : null;
 
     return Scaffold(
       appBar: AppBar(
@@ -420,8 +592,8 @@ class _CameraListPageState extends ConsumerState<CameraListPage> {
                       child: ListView(
                         padding: const EdgeInsets.all(16),
                         children: [
-                          // Active camera indicator
-                          if (activeCameraId != null)
+                          // Active cameras indicator (show if any are active)
+                          if (activeCameras.isNotEmpty)
                             Container(
                               margin: const EdgeInsets.only(bottom: 16),
                               padding: const EdgeInsets.all(16),
@@ -438,15 +610,21 @@ class _CameraListPageState extends ConsumerState<CameraListPage> {
                                     child: Column(
                                       crossAxisAlignment: CrossAxisAlignment.start,
                                       children: [
-                                        const Text(
-                                          'Active Camera',
-                                          style: TextStyle(
+                                        Text(
+                                          '${activeCameras.length} Active Camera${activeCameras.length > 1 ? 's' : ''}',
+                                          style: const TextStyle(
                                             fontWeight: FontWeight.bold,
                                             color: Colors.green,
                                           ),
                                         ),
                                         Text(
-                                          _zones.firstWhere((z) => z.id == activeCameraId, orElse: () => _zones.first).name,
+                                          activeCameras.map((id) {
+                                            try {
+                                              return _zones.firstWhere((z) => z.id == id).name;
+                                            } catch (e) {
+                                              return id;
+                                            }
+                                          }).join(', '),
                                           style: TextStyle(
                                             fontSize: 14,
                                             color: AppTheme.mutedForeground,
@@ -458,8 +636,11 @@ class _CameraListPageState extends ConsumerState<CameraListPage> {
                                 ],
                               ),
                             ),
-                          // Camera list
-                          ..._zones.map((zone) => _buildCameraCard(zone, activeCameraId == zone.id)),
+                          // Camera list - use monitoring status from API for each zone
+                          ..._zones.map((zone) {
+                            final isActive = _zoneMonitoringStatus[zone.id] ?? false;
+                            return _buildCameraCard(zone, isActive);
+                          }),
                         ],
                       ),
                     ),

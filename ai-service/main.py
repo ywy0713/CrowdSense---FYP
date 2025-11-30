@@ -11,9 +11,8 @@ import os
 import time
 import argparse
 import socket
-import requests
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
 # Firebase removed - Flutter app handles Firebase storage
@@ -57,6 +56,11 @@ zone_captures: Dict[str, cv2.VideoCapture] = {}
 zone_frames: Dict[str, bytes] = {}
 zone_frame_locks: Dict[str, asyncio.Lock] = {}
 
+# Shared frame buffer for zones using the same camera
+# Key: camera identifier (camera_index or camera_url), Value: (frame, timestamp, lock)
+shared_frames: Dict[str, Tuple[Optional[np.ndarray], float, asyncio.Lock]] = {}
+shared_frame_locks: Dict[str, asyncio.Lock] = {}
+
 # Store current people counts for each zone (for API access without Firebase)
 zone_people_counts: Dict[str, int] = {}
 zone_last_updated: Dict[str, int] = {}
@@ -69,144 +73,8 @@ _external_camera_server: Optional[HTTPServer] = None
 _external_camera: Optional[cv2.VideoCapture] = None
 
 
-# ============================================================================
-# HTTP Stream Handler for MJPEG streams
-# ============================================================================
-
-class HTTPStreamCapture:
-    """Custom capture class for HTTP MJPEG streams"""
-    def __init__(self, url: str):
-        self.url = url
-        self.stream = None
-        self.current_frame = None
-        self._opened = False
-        self._connect()
-    
-    def _connect(self):
-        """Connect to HTTP stream"""
-        try:
-            print(f"[HTTP Stream] Connecting to {self.url}...")
-            response = requests.get(self.url, stream=True, timeout=15)
-            if response.status_code == 200:
-                self.stream = response.iter_content(chunk_size=1024)
-                self._opened = True
-                print(f"[HTTP Stream] ✅ Connected successfully")
-            else:
-                print(f"[HTTP Stream] ❌ Failed: HTTP {response.status_code}")
-                self._opened = False
-        except requests.exceptions.Timeout:
-            print(f"[HTTP Stream] ❌ Connection timeout: Unable to connect to {self.url}")
-            print(f"[HTTP Stream] 💡 Please check:")
-            print(f"[HTTP Stream]    1. External camera server is running")
-            print(f"[HTTP Stream]    2. Network connection is available")
-            print(f"[HTTP Stream]    3. Firewall allows connections")
-            self._opened = False
-        except requests.exceptions.ConnectionError as e:
-            print(f"[HTTP Stream] ❌ Connection error: Unable to reach {self.url}")
-            print(f"[HTTP Stream] 💡 Please check if the external camera server is running")
-            self._opened = False
-        except Exception as e:
-            print(f"[HTTP Stream] ❌ Connection error: {e}")
-            self._opened = False
-    
-    def read(self):
-        """Read a frame from the stream"""
-        if not self._opened:
-            # Try to reconnect
-            self._connect()
-            if not self._opened:
-                return False, None
-        
-        try:
-            # Reconnect if stream is None
-            if self.stream is None:
-                self._connect()
-                if self.stream is None:
-                    return False, None
-            
-            # Read MJPEG stream - look for JPEG markers
-            jpeg_data = b''
-            in_frame = False
-            max_iterations = 1000  # Prevent infinite loop
-            iteration = 0
-            
-            for chunk in self.stream:
-                iteration += 1
-                if iteration > max_iterations:
-                    print(f"[HTTP Stream] Max iterations reached, reconnecting...")
-                    self._connect()
-                    return False, None
-                
-                if not chunk:
-                    continue
-                
-                jpeg_data += chunk
-                
-                # Look for JPEG start marker (0xFF 0xD8)
-                if b'\xff\xd8' in jpeg_data:
-                    start_idx = jpeg_data.find(b'\xff\xd8')
-                    jpeg_data = jpeg_data[start_idx:]
-                    in_frame = True
-                
-                # Look for JPEG end marker (0xFF 0xD9)
-                if in_frame and b'\xff\xd9' in jpeg_data:
-                    end_idx = jpeg_data.find(b'\xff\xd9') + 2
-                    frame_data = jpeg_data[:end_idx]
-                    jpeg_data = jpeg_data[end_idx:]
-                    
-                    # Decode JPEG
-                    try:
-                        frame_array = np.frombuffer(frame_data, dtype=np.uint8)
-                        frame = cv2.imdecode(frame_array, cv2.IMREAD_COLOR)
-                        if frame is not None:
-                            self.current_frame = frame
-                            return True, frame
-                    except Exception as e:
-                        print(f"[HTTP Stream] Decode error: {e}")
-                        continue
-                
-                # Limit buffer size to prevent memory issues
-                if len(jpeg_data) > 1024 * 1024:  # 1MB limit
-                    jpeg_data = b''
-                    in_frame = False
-                    print(f"[HTTP Stream] Buffer limit reached, resetting...")
-            
-            # Stream ended, reconnect
-            print(f"[HTTP Stream] Stream ended, reconnecting...")
-            self._connect()
-            return False, None
-        except Exception as e:
-            print(f"[HTTP Stream] Read error: {e}, reconnecting...")
-            self._connect()
-            return False, None
-    
-    def isOpened(self):
-        return self._opened
-    
-    def release(self):
-        self._opened = False
-        self.stream = None
-        self.current_frame = None
-    
-    def get(self, prop):
-        """Return default values for compatibility"""
-        if prop == cv2.CAP_PROP_FRAME_WIDTH:
-            return 640
-        elif prop == cv2.CAP_PROP_FRAME_HEIGHT:
-            return 480
-        elif prop == cv2.CAP_PROP_FPS:
-            return 30
-        return 0
-
-
-def _create_http_stream_capture(url: str):
-    """Create a capture object for HTTP MJPEG stream"""
-    try:
-        return HTTPStreamCapture(url)
-    except Exception as e:
-        print(f"[ERROR] Failed to create HTTP stream capture: {e}")
-        return None
-
+# HTTP Stream Handler removed - using OpenCV VideoCapture directly (like old version)
+# OpenCV can handle HTTP MJPEG streams, though with some limitations
 
 class ZoneConfig(BaseModel):
     zone_id: str
@@ -254,7 +122,7 @@ async def monitor_zone(config: ZoneConfig):
     # Yield control immediately to avoid blocking the caller
     await asyncio.sleep(0)
     
-    global detector
+    global detector, _external_camera, _external_camera_server
     
     # Wait for detector to be initialized (with timeout)
     max_wait = 30  # Maximum 30 seconds
@@ -287,44 +155,268 @@ async def monitor_zone(config: ZoneConfig):
     print(f"Attempting to open camera: {camera_url}")
     
     cap = None
+    is_shared_camera = False
+    camera_id = None
     try:
         # Try to convert to integer if it's a numeric string (for direct camera)
         camera_index = int(camera_url)
         print(f"Opening camera with index: {camera_index}")
-        cap = cv2.VideoCapture(camera_index)
         
-        # Set camera properties - Use normal resolution
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)  # Normal resolution
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)  # Normal resolution
-        cap.set(cv2.CAP_PROP_FPS, 30)  # 30 FPS
+        # Create camera identifier for this direct camera
+        camera_id = f"direct_camera_{camera_index}"
         
-        # Verify settings were applied
-        actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        actual_fps = cap.get(cv2.CAP_PROP_FPS)
-        print(f"Camera settings: Requested 640x480@30fps, Got {actual_width}x{actual_height}@{actual_fps}fps")
+        # Check if external_camera_server is using this camera
+        if _external_camera is not None and _external_camera.isOpened():
+            # External camera server is active - check if it's using the same camera index
+            # We'll assume it's using camera 0 by default (can be configured)
+            # If user wants to use direct camera 0, we should share with external_camera
+            if camera_index == 0:  # Default camera index
+                print(f"[INFO] External camera server detected. Sharing camera {camera_index} with external camera server.")
+                cap = _external_camera
+                is_shared_camera = True
+                camera_id = "external_camera_shared"
+                # Initialize shared frame buffer if not exists
+                if camera_id not in shared_frame_locks:
+                    shared_frame_locks[camera_id] = asyncio.Lock()
+                    shared_frames[camera_id] = (None, 0.0, asyncio.Lock())
+            else:
+                print(f"[WARN] External camera server is active, but using different camera index.")
+                print(f"[WARN] Attempting to open camera {camera_index} directly...")
+                cap = cv2.VideoCapture(camera_index)
+        else:
+            # Check if another zone is already using this camera (direct camera)
+            existing_cap = None
+            for zone_id, existing_cap_obj in zone_captures.items():
+                if zone_id != config.zone_id:
+                    # Check if this is a direct camera capture (not HTTP stream, not external_camera)
+                    if isinstance(existing_cap_obj, cv2.VideoCapture) and existing_cap_obj is not _external_camera:
+                        # Check if it's likely the same camera index by checking if it's opened
+                        # We'll assume if it's a direct camera VideoCapture, it might be the same
+                        # In practice, we can't easily check the camera index, so we'll be conservative
+                        # Only share if we're sure it's safe (e.g., both are camera 0)
+                        if camera_index == 0:  # Only share camera 0 for safety
+                            existing_cap = existing_cap_obj
+                            print(f"[INFO] Found existing direct camera capture for camera {camera_index}, will attempt to share")
+                            break
+            
+            if existing_cap is not None and existing_cap.isOpened():
+                # Another zone is already using a direct camera - share the VideoCapture object
+                print(f"[INFO] Sharing VideoCapture object for camera {camera_index} with another zone")
+                cap = existing_cap
+                is_shared_camera = True
+                # Initialize shared frame buffer if not exists
+                if camera_id not in shared_frame_locks:
+                    shared_frame_locks[camera_id] = asyncio.Lock()
+                    shared_frames[camera_id] = (None, 0.0, asyncio.Lock())
+            else:
+                # No existing capture, open new one
+                cap = cv2.VideoCapture(camera_index)
         
-        # Try to open camera with retries
-        if not cap.isOpened():
-            print(f"First attempt failed, retrying camera {camera_index}...")
-            cap.release()
-            await asyncio.sleep(0.5)
-            cap = cv2.VideoCapture(camera_index)
+        # Set camera properties only if not shared (shared camera already has properties set)
+        if not is_shared_camera:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)  # Normal resolution
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)  # Normal resolution
+            cap.set(cv2.CAP_PROP_FPS, 30)  # 30 FPS
+            
+            # Verify settings were applied
+            actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            actual_fps = cap.get(cv2.CAP_PROP_FPS)
+            print(f"Camera settings: Requested 640x480@30fps, Got {actual_width}x{actual_height}@{actual_fps}fps")
+            
+            # Try to open camera with retries
+            if not cap.isOpened():
+                print(f"First attempt failed, retrying camera {camera_index}...")
+                cap.release()
+                await asyncio.sleep(0.5)
+                cap = cv2.VideoCapture(camera_index)
+        else:
+            print(f"[INFO] Using shared camera, skipping property setup")
             
     except (ValueError, TypeError) as e:
         # Use as string URL for RTSP/HTTP streams
         print(f"Using camera as URL string: {camera_url}")
         
-        # Check if it's an HTTP URL - OpenCV has issues with HTTP MJPEG streams
+        # Check if this is an external camera server URL
+        is_external_camera_url = False
         if camera_url.startswith('http://') or camera_url.startswith('https://'):
-            print(f"[INFO] HTTP stream detected, using requests for better compatibility")
-            # For HTTP streams, we'll use a custom reader that handles MJPEG properly
-            cap = _create_http_stream_capture(camera_url)
+            try:
+                from urllib.parse import urlparse
+                parsed = urlparse(camera_url)
+                # Check if it's localhost or local IP
+                is_localhost = parsed.hostname in ['localhost', '127.0.0.1', '0.0.0.0'] or \
+                               parsed.hostname is None or \
+                               parsed.hostname.startswith('192.168.') or \
+                               parsed.hostname.startswith('10.') or \
+                               parsed.hostname.startswith('172.')
+                # Check if path is /video (external camera server endpoint)
+                is_video_path = parsed.path == '/video' or parsed.path.endswith('/video')
+                # Check if port is 8080 (default) or matches external camera server port
+                is_port_8080 = parsed.port == 8080 or (parsed.port is None and ':8080' in camera_url)
+                
+                if is_localhost and is_video_path and is_port_8080:
+                    is_external_camera_url = True
+                    print(f"[INFO] Detected external camera server URL: {camera_url}")
+            except Exception as parse_error:
+                print(f"[WARN] Could not parse URL: {parse_error}")
+        
+        # If it's external camera server URL, use shared camera
+        if is_external_camera_url:
+            # Check if external camera server is already running and working
+            # Need to verify both server and camera are actually functional
+            external_camera_available = False
+            if _external_camera_server is not None and _external_camera is not None:
+                # Verify camera is actually opened and can read frames
+                if _external_camera.isOpened():
+                    # Try to read a test frame to verify it's working
+                    test_ret, test_frame = _external_camera.read()
+                    if test_ret and test_frame is not None:
+                        external_camera_available = True
+                        print(f"[INFO] ✅ External camera server is already running and working, reusing it")
+                    else:
+                        print(f"[INFO] ⚠️ External camera server exists but cannot read frames, will restart")
+                        # Clean up broken external camera server
+                        try:
+                            if _external_camera:
+                                _external_camera.release()
+                            _external_camera = None
+                            _external_camera_server = None
+                        except Exception as e:
+                            print(f"[WARN] Error cleaning up broken external camera: {e}")
+                else:
+                    print(f"[INFO] ⚠️ External camera server exists but camera is not opened, will restart")
+                    # Clean up broken external camera server
+                    _external_camera = None
+                    _external_camera_server = None
+            
+            if external_camera_available:
+                cap = _external_camera
+                is_shared_camera = True
+                camera_id = "external_camera_shared"
+                # Initialize shared frame buffer if not exists
+                if camera_id not in shared_frame_locks:
+                    shared_frame_locks[camera_id] = asyncio.Lock()
+                    shared_frames[camera_id] = (None, 0.0, asyncio.Lock())
+            else:
+                # Try to find an available camera index
+                print(f"[INFO] External camera server not running, starting it...")
+                camera_index = 0
+                camera_found = False
+                
+                # Try camera indices 0-3 to find an available camera
+                for idx in range(4):
+                    print(f"[INFO] Trying to open camera index {idx}...")
+                    test_cap = cv2.VideoCapture(idx)
+                    if test_cap.isOpened():
+                        # Test reading a frame
+                        ret, frame = test_cap.read()
+                        if ret and frame is not None:
+                            print(f"[INFO] ✅ Camera index {idx} is available and working")
+                            test_cap.release()
+                            camera_index = idx
+                            camera_found = True
+                            break
+                        else:
+                            test_cap.release()
+                    else:
+                        test_cap.release()
+                
+                if not camera_found:
+                    print(f"[ERROR] ❌ No available camera found (tried indices 0-3)")
+                    print(f"[ERROR] Please check:")
+                    print(f"[ERROR]   1. Camera is connected")
+                    print(f"[ERROR]   2. Camera is not being used by another application")
+                    print(f"[ERROR]   3. Camera permissions are granted")
+                    cap = None
+                else:
+                    # Start external camera server with the found camera index
+                    print(f"[INFO] Starting external camera server with camera index {camera_index}...")
+                    
+                    # Wait a bit before starting to ensure previous camera resources are fully released
+                    # This is important after deactivate/activate cycle
+                    await asyncio.sleep(1.0)
+                    print(f"[INFO] Waiting period completed, starting external camera server...")
+                    
+                    thread = start_external_camera_server(8080, camera_index)
+                    # Wait for server to start and camera to open (with retries)
+                    max_wait = 15  # Maximum 15 seconds (increased for resource release)
+                    wait_count = 0
+                    while wait_count < max_wait:
+                        await asyncio.sleep(0.5)
+                        wait_count += 0.5
+                        if _external_camera is not None and _external_camera.isOpened():
+                            # Test reading a frame to verify it's actually working
+                            test_ret, test_frame = _external_camera.read()
+                            if test_ret and test_frame is not None:
+                                print(f"[INFO] ✅ External camera server started successfully after {wait_count:.1f}s")
+                                break
+                            else:
+                                # Camera opened but can't read frames yet, keep waiting
+                                if wait_count % 2 == 0:
+                                    print(f"[INFO] Camera opened but cannot read frames yet, waiting... ({wait_count:.0f}s)")
+                        if wait_count % 2 == 0:
+                            print(f"[INFO] Waiting for external camera server to start... ({wait_count:.0f}s)")
+                    
+                    # Check again if external camera is available
+                    if _external_camera is not None and _external_camera.isOpened():
+                        # Final verification - test reading a frame
+                        test_ret, test_frame = _external_camera.read()
+                        if test_ret and test_frame is not None:
+                            print(f"[INFO] ✅ External camera server is running and camera is opened")
+                            print(f"[INFO] Using shared VideoCapture from external camera server")
+                            print(f"[INFO] ✅ External camera frame read test successful: {test_frame.shape}")
+                            
+                            cap = _external_camera
+                            is_shared_camera = True
+                            camera_id = "external_camera_shared"
+                            # Initialize shared frame buffer if not exists
+                            if camera_id not in shared_frame_locks:
+                                shared_frame_locks[camera_id] = asyncio.Lock()
+                                shared_frames[camera_id] = (None, 0.0, asyncio.Lock())
+                        else:
+                            print(f"[WARN] ⚠️ External camera opened but failed to read test frame")
+                            print(f"[WARN] This might be temporary - will continue trying")
+                            # Still use it, but log the warning
+                            cap = _external_camera
+                            is_shared_camera = True
+                            camera_id = "external_camera_shared"
+                            if camera_id not in shared_frame_locks:
+                                shared_frame_locks[camera_id] = asyncio.Lock()
+                                shared_frames[camera_id] = (None, 0.0, asyncio.Lock())
+                    else:
+                        print(f"[ERROR] ❌ Failed to start external camera server or camera not available")
+                        print(f"[ERROR] Debug info:")
+                        print(f"[ERROR]   _external_camera_server is None: {_external_camera_server is None}")
+                        print(f"[ERROR]   _external_camera is None: {_external_camera is None}")
+                        if _external_camera is not None:
+                            print(f"[ERROR]   _external_camera.isOpened(): {_external_camera.isOpened()}")
+                        print(f"[ERROR] Possible reasons:")
+                        print(f"[ERROR]   1. Camera resource not fully released from previous session")
+                        print(f"[ERROR]   2. Camera is being used by another application")
+                        print(f"[ERROR]   3. Camera permissions not granted")
+                        print(f"[ERROR] Zone {config.zone_id} will use placeholder frame")
+                        cap = None
         else:
-            # RTSP or other protocols - use OpenCV directly
+            # For other HTTP/RTSP URLs, use OpenCV directly
+            print(f"[INFO] Opening HTTP/RTSP stream: {camera_url}")
             cap = cv2.VideoCapture(camera_url)
             # Set buffer size to reduce latency
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            
+            # Wait a bit for connection to establish (especially for HTTP streams)
+            await asyncio.sleep(0.5)
+            
+            # Try to read a test frame to verify connection
+            if cap.isOpened():
+                print(f"[INFO] Stream opened, testing frame read...")
+                test_ret, test_frame = cap.read()
+                if test_ret and test_frame is not None:
+                    print(f"✅ HTTP/RTSP stream connection verified: {test_frame.shape}")
+                else:
+                    print(f"⚠️ Warning: HTTP/RTSP stream opened but failed to read test frame")
+                    print(f"   This might be normal for some streams - will continue trying")
+            else:
+                print(f"❌ Failed to open HTTP/RTSP stream: {camera_url}")
     except Exception as e:
         print(f"Error creating VideoCapture: {e}")
         cap = None
@@ -370,9 +462,20 @@ async def monitor_zone(config: ZoneConfig):
     zone_captures[config.zone_id] = cap
     zone_frame_locks[config.zone_id] = asyncio.Lock()
     
+    # Initialize video recorder for this zone
+    video_recorder = VideoRecorder(config.zone_id)
+    zone_video_recorders[config.zone_id] = video_recorder
+    
     # Test reading a frame immediately to verify it works
+    # Use lock if shared camera
     print(f"🔍 Testing frame read for {config.zone_id}...")
-    test_ret, test_frame = cap.read()
+    if is_shared_camera and camera_id in shared_frame_locks:
+        lock = shared_frame_locks[camera_id]
+        async with lock:
+            test_ret, test_frame = cap.read()
+    else:
+        test_ret, test_frame = cap.read()
+    
     if test_ret and test_frame is not None:
         frame_mean = test_frame.mean()
         print(f"✅ Test frame read successfully: {test_frame.shape}, brightness={frame_mean:.2f}")
@@ -387,32 +490,18 @@ async def monitor_zone(config: ZoneConfig):
         if buffer is not None:
             zone_frames[config.zone_id] = buffer.tobytes()
             print(f"✅ Initial frame stored for streaming")
-    else:
-        print(f"❌ ERROR: Test frame read failed! ret={test_ret}, frame is None: {test_frame is None}")
-    
-    print(f"✅ Camera opened successfully for zone: {config.zone_id}")
-    print(f"   Resolution: {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
-    print(f"   FPS: {cap.get(cv2.CAP_PROP_FPS)}")
-    
-    # Store capture object and create lock for frame access
-    zone_captures[config.zone_id] = cap
-    zone_frame_locks[config.zone_id] = asyncio.Lock()
-    
-    # Initialize video recorder for this zone
-    video_recorder = VideoRecorder(config.zone_id)
-    zone_video_recorders[config.zone_id] = video_recorder
-    
-    # Test reading a frame immediately to verify it works
-    test_ret, test_frame = cap.read()
-    if test_ret and test_frame is not None:
-        print(f"✅ Test frame read successfully: {test_frame.shape}")
-        # Store initial frame
-        _, buffer = cv2.imencode('.jpg', test_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        if buffer is not None:
-            zone_frames[config.zone_id] = buffer.tobytes()
-            print(f"✅ Initial frame stored for streaming")
+        # Update shared frame if using shared camera
+        if is_shared_camera and camera_id in shared_frame_locks:
+            shared_frames[camera_id] = (test_frame.copy(), time.time(), shared_frame_locks[camera_id])
     else:
         print(f"⚠️ Warning: Test frame read failed, but continuing...")
+    
+    print(f"✅ Camera opened successfully for zone: {config.zone_id}")
+    if not is_shared_camera:
+        print(f"   Resolution: {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
+        print(f"   FPS: {cap.get(cv2.CAP_PROP_FPS)}")
+    else:
+        print(f"   Using shared camera (camera_id: {camera_id})")
     
     try:
         # Keep monitoring even if config.enabled changes (only stop when task is cancelled)
@@ -422,11 +511,18 @@ async def monitor_zone(config: ZoneConfig):
                 print(f"Monitoring task cancelled for {config.zone_id}")
                 break
                 
-            # Read frame synchronously
-            # Handle both OpenCV VideoCapture and custom HTTPStreamCapture
-            if isinstance(cap, HTTPStreamCapture):
-                ret, frame = cap.read()
+            # Read frame synchronously (OpenCV operations are fast enough)
+            # If using shared camera (external_camera), use lock to prevent concurrent reads
+            if is_shared_camera and camera_id in shared_frame_locks:
+                # Use shared frame lock to prevent concurrent reads from same camera
+                lock = shared_frame_locks[camera_id]
+                async with lock:
+                    ret, frame = cap.read()
+                    # Update shared frame buffer for other zones using same camera
+                    if ret and frame is not None:
+                        shared_frames[camera_id] = (frame.copy(), time.time(), lock)
             else:
+                # Normal read for non-shared cameras
                 ret, frame = cap.read()
             
             # Resize frame for detection if too large (but keep reasonable size for Haar Cascade)
@@ -447,7 +543,8 @@ async def monitor_zone(config: ZoneConfig):
                     print(f"❌ Camera closed unexpectedly for {config.zone_id}, attempting to reopen...")
                     try:
                         camera_url = config.camera_url or config.rtsp_url
-                        cap.release()
+                        if cap is not None:
+                            cap.release()
                         await asyncio.sleep(0.5)
                         
                         # Use the same logic as initial camera opening
@@ -462,15 +559,9 @@ async def monitor_zone(config: ZoneConfig):
                         except (ValueError, TypeError):
                             # Use as string URL for RTSP/HTTP streams
                             print(f"Reopening camera as URL string: {camera_url}")
-                            
-                            # Check if it's an HTTP URL
-                            if camera_url.startswith('http://') or camera_url.startswith('https://'):
-                                print(f"[INFO] HTTP stream detected, using requests for better compatibility")
-                                cap = _create_http_stream_capture(camera_url)
-                            else:
-                                # RTSP or other protocols - use OpenCV directly
-                                cap = cv2.VideoCapture(camera_url)
-                                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                            cap = cv2.VideoCapture(camera_url)
+                            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                            await asyncio.sleep(0.5)  # Wait for connection
                         
                         if cap is not None and cap.isOpened():
                             zone_captures[config.zone_id] = cap
@@ -480,7 +571,7 @@ async def monitor_zone(config: ZoneConfig):
                     except Exception as e:
                         print(f"❌ Error reopening camera: {e}")
                 # Keep trying to read frames
-                    await asyncio.sleep(0.2)  # Slightly longer sleep to reduce CPU usage
+                await asyncio.sleep(0.2)  # Slightly longer sleep to reduce CPU usage
                 continue
             
             # Add frame to video recorder buffer (always at 30 FPS)
@@ -598,12 +689,19 @@ async def monitor_zone(config: ZoneConfig):
         print(f"Error monitoring zone {config.zone_id}: {e}")
     finally:
         # Only release if cap exists and was opened
+        # But don't release if it's shared with external_camera_server
         if 'cap' in locals() and cap is not None:
-            try:
-                cap.release()
-                print(f"Camera released for zone: {config.zone_id}")
-            except Exception as e:
-                print(f"Error releasing camera: {e}")
+            # Check if this is the shared external camera
+            is_shared_camera = (cap is _external_camera and _external_camera is not None)
+            
+            if not is_shared_camera:
+                try:
+                    cap.release()
+                    print(f"Camera released for zone: {config.zone_id}")
+                except Exception as e:
+                    print(f"Error releasing camera: {e}")
+            else:
+                print(f"Camera for zone {config.zone_id} is shared with external camera server, not releasing")
         
         # Cleanup zone resources
         if config.zone_id in zone_captures:
@@ -659,9 +757,37 @@ async def start_monitoring(config: ZoneConfig):
 async def stop_monitoring(zone_id: str):
     """Stop monitoring a zone"""
     if zone_id not in monitoring_tasks:
-        raise HTTPException(status_code=404, detail="Zone not being monitored")
+        # Check if zone is using external camera server
+        # If so, we should still return success (external camera server is independent)
+        print(f"[INFO] Zone {zone_id} not in monitoring_tasks, may be using external camera server")
+        # Check if any other zones are using external_camera
+        zones_using_external = []
+        for other_zone_id, other_task in monitoring_tasks.items():
+            if other_zone_id != zone_id:
+                # Check if this zone is using external_camera (would be in zone_captures)
+                if other_zone_id in zone_captures:
+                    cap = zone_captures[other_zone_id]
+                    if cap is _external_camera:
+                        zones_using_external.append(other_zone_id)
+        
+        if not zones_using_external and _external_camera is not None and _external_camera_server is not None:
+            # No other zones using external camera, but external camera server is running
+            # This means the zone was using external camera server directly (not via Python monitoring)
+            # We can't stop external camera server here as it's independent
+            print(f"[INFO] Zone {zone_id} was using external camera server, but external camera server is independent")
+            print(f"[INFO] External camera server will continue running until manually stopped")
+        
+        return {"message": "Zone not in monitoring tasks (may be using external stream)", "zone_id": zone_id}
     
     task = monitoring_tasks[zone_id]
+    
+    # Check if this zone is using external_camera before cancelling
+    is_using_external = False
+    if zone_id in zone_captures:
+        cap = zone_captures[zone_id]
+        if cap is _external_camera:
+            is_using_external = True
+    
     task.cancel()
     
     # Wait for task to finish cleanup
@@ -672,8 +798,25 @@ async def stop_monitoring(zone_id: str):
     
     del monitoring_tasks[zone_id]
     
+    # Check if external_camera should be released
+    # Only release if no other zones are using it
+    if is_using_external:
+        other_zones_using_external = []
+        for other_zone_id, other_task in monitoring_tasks.items():
+            if other_zone_id in zone_captures:
+                other_cap = zone_captures[other_zone_id]
+                if other_cap is _external_camera:
+                    other_zones_using_external.append(other_zone_id)
+        
+        if not other_zones_using_external:
+            print(f"[INFO] No other zones using external camera, but external camera server is independent")
+            print(f"[INFO] External camera server will continue running until manually stopped")
+            # Note: We don't stop external_camera_server here because it's independent
+            # The user should stop it manually if needed
+    
     # Zone status updates are handled by Flutter app
     
+    print(f"[INFO] Monitoring stopped for zone {zone_id}, camera resources released")
     return {"message": "Monitoring stopped", "zone_id": zone_id}
 
 
@@ -907,10 +1050,25 @@ async def get_video_list(zone_id: str):
     # Try to get from active recorder first
     if zone_id in zone_video_recorders:
         videos = zone_video_recorders[zone_id].get_video_list()
+        # Verify files exist for active recorder too
+        storage_path = Path(zone_video_recorders[zone_id].storage_path)
+        valid_videos = []
+        for video in videos:
+            video_filename = video.get("filename", "")
+            video_path = storage_path / video_filename
+            if video_path.exists():
+                valid_videos.append(video)
+            else:
+                print(f"[WARN] Video file not found, removing from list: {video_filename}")
+        videos = valid_videos
     else:
         # Zone not monitoring, but videos may still exist on disk
         # Try to load from metadata.json file
         recordings_path = Path("recordings") / zone_id / "metadata.json"
+        video_dir = Path("recordings") / zone_id
+        videos = []
+        metadata_updated = False
+        
         if recordings_path.exists():
             try:
                 with open(recordings_path, 'r') as f:
@@ -919,8 +1077,31 @@ async def get_video_list(zone_id: str):
             except Exception as e:
                 print(f"[WARN] Failed to load metadata for zone {zone_id}: {e}")
                 videos = []
-        else:
-            videos = []
+        
+        # Verify each video file exists, remove invalid entries
+        valid_videos = []
+        for video in videos:
+            video_filename = video.get("filename", "")
+            video_path = video_dir / video_filename
+            if video_path.exists():
+                valid_videos.append(video)
+            else:
+                print(f"[WARN] Video file not found, removing from list: {video_filename}")
+                metadata_updated = True
+        
+        # Update metadata.json if we removed invalid entries
+        if metadata_updated and recordings_path.exists():
+            try:
+                with open(recordings_path, 'r') as f:
+                    metadata = json.load(f)
+                metadata["videos"] = valid_videos
+                with open(recordings_path, 'w') as f:
+                    json.dump(metadata, f, indent=2)
+                print(f"[INFO] Cleaned metadata.json for zone {zone_id}, removed {len(videos) - len(valid_videos)} invalid entries")
+            except Exception as e:
+                print(f"[ERROR] Failed to update metadata for zone {zone_id}: {e}")
+        
+        videos = valid_videos
     
     # Sort by timestamp (newest first)
     videos.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
@@ -933,6 +1114,9 @@ async def delete_video(zone_id: str, video_filename: str):
     from pathlib import Path
     import json
     
+    success = False
+    metadata_updated = False
+    
     # Try to delete using active recorder first
     if zone_id in zone_video_recorders:
         success = zone_video_recorders[zone_id].delete_video(video_filename)
@@ -941,28 +1125,87 @@ async def delete_video(zone_id: str, video_filename: str):
         video_path = Path("recordings") / zone_id / video_filename
         metadata_path = Path("recordings") / zone_id / "metadata.json"
         
-        success = False
+        # Try to delete file if it exists
         if video_path.exists():
             try:
                 video_path.unlink()
-                # Update metadata if it exists
-                if metadata_path.exists():
-                    with open(metadata_path, 'r') as f:
-                        metadata = json.load(f)
-                    metadata["videos"] = [
-                        v for v in metadata.get("videos", [])
-                        if v.get("filename") != video_filename
-                    ]
-                    with open(metadata_path, 'w') as f:
-                        json.dump(metadata, f, indent=2)
                 success = True
             except Exception as e:
-                print(f"[ERROR] Failed to delete video {video_filename}: {e}")
+                print(f"[ERROR] Failed to delete video file {video_filename}: {e}")
+        
+        # Always update metadata to remove the entry, even if file doesn't exist
+        # This handles the case where metadata has stale entries
+        if metadata_path.exists():
+            try:
+                with open(metadata_path, 'r') as f:
+                    metadata = json.load(f)
+                original_count = len(metadata.get("videos", []))
+                metadata["videos"] = [
+                    v for v in metadata.get("videos", [])
+                    if v.get("filename") != video_filename
+                ]
+                if len(metadata["videos"]) < original_count:
+                    with open(metadata_path, 'w') as f:
+                        json.dump(metadata, f, indent=2)
+                    metadata_updated = True
+                    success = True  # Consider it success if we removed from metadata
+                    print(f"[INFO] Removed {video_filename} from metadata (file may not have existed)")
+            except Exception as e:
+                print(f"[ERROR] Failed to update metadata for zone {zone_id}: {e}")
     
     if not success:
         raise HTTPException(status_code=404, detail="Video not found")
     
     return {"message": "Video deleted successfully", "filename": video_filename}
+
+
+@app.post("/zones/{zone_id}/videos/cleanup")
+async def cleanup_video_metadata(zone_id: str):
+    """Clean up metadata.json by removing entries for videos that don't exist on disk"""
+    from pathlib import Path
+    import json
+    
+    metadata_path = Path("recordings") / zone_id / "metadata.json"
+    
+    if not metadata_path.exists():
+        return {"message": "No metadata file found", "removed_count": 0}
+    
+    try:
+        with open(metadata_path, 'r') as f:
+            metadata = json.load(f)
+        
+        videos = metadata.get("videos", [])
+        original_count = len(videos)
+        
+        # Determine video directory path
+        if zone_id in zone_video_recorders:
+            video_dir = Path(zone_video_recorders[zone_id].storage_path)
+        else:
+            video_dir = Path("recordings") / zone_id
+        
+        # Filter out videos that don't exist
+        valid_videos = []
+        for video in videos:
+            video_filename = video.get("filename", "")
+            video_path = video_dir / video_filename
+            if video_path.exists():
+                valid_videos.append(video)
+        
+        removed_count = original_count - len(valid_videos)
+        
+        # Update metadata
+        metadata["videos"] = valid_videos
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        return {
+            "message": f"Cleaned up metadata for zone {zone_id}",
+            "removed_count": removed_count,
+            "remaining_count": len(valid_videos)
+        }
+    except Exception as e:
+        print(f"[ERROR] Failed to cleanup metadata for zone {zone_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to cleanup metadata: {str(e)}")
 
 
 @app.get("/zones/{zone_id}/videos/{video_filename}/stream")
@@ -1064,6 +1307,52 @@ def start_external_camera_server(port: int = 8080, camera_index: int = 0):
     """Start external camera HTTP stream server in background thread"""
     global _external_camera_server, _external_camera
     
+    # If external camera server is already running, stop it first to avoid conflicts
+    # This ensures clean restart after hot restart or deactivate/activate cycle
+    if _external_camera_server is not None or _external_camera is not None:
+        print(f"[INFO] External camera server already exists, cleaning up first...")
+        try:
+            # Release camera if exists
+            if _external_camera is not None:
+                try:
+                    if _external_camera.isOpened():
+                        _external_camera.release()
+                        print(f"[INFO] Released existing camera")
+                except Exception as e:
+                    print(f"[WARN] Error releasing existing camera: {e}")
+                _external_camera = None
+            
+            # Stop server if exists
+            if _external_camera_server is not None:
+                try:
+                    import threading
+                    def shutdown_server():
+                        try:
+                            _external_camera_server.shutdown()
+                        except Exception as e:
+                            print(f"[WARN] Error in shutdown: {e}")
+                    
+                    shutdown_thread = threading.Thread(target=shutdown_server, daemon=True)
+                    shutdown_thread.start()
+                    shutdown_thread.join(timeout=1.0)
+                    
+                    try:
+                        _external_camera_server.server_close()
+                    except Exception as e:
+                        print(f"[WARN] Error closing server: {e}")
+                    print(f"[INFO] Stopped existing server")
+                except Exception as e:
+                    print(f"[WARN] Error stopping existing server: {e}")
+                
+                _external_camera_server = None
+            
+            # Wait a bit for cleanup to complete (important for camera resource release)
+            import time
+            time.sleep(1.5)  # Increased wait time to ensure camera resource is fully released
+            print(f"[INFO] Cleanup completed, starting new external camera server...")
+        except Exception as e:
+            print(f"[WARN] Error cleaning up existing external camera server: {e}")
+    
     def run_server():
         global _external_camera_server, _external_camera
         
@@ -1075,6 +1364,9 @@ def start_external_camera_server(port: int = 8080, camera_index: int = 0):
             if not camera.isOpened():
                 print(f"[External Camera] ⚠️  Warning: Could not open camera {camera_index}")
                 print(f"[External Camera]    This is OK if you don't need external camera streaming")
+                # Set global variables to None to indicate failure
+                _external_camera = None
+                _external_camera_server = None
                 return
             
             # Set camera properties
@@ -1142,6 +1434,76 @@ async def get_external_camera_status():
     }
 
 
+@app.post("/external-camera/stop")
+async def stop_external_camera():
+    """Stop external camera server and release camera"""
+    global _external_camera_server, _external_camera
+    
+    # Check if any zones are using external_camera
+    zones_using_external = []
+    for zone_id in monitoring_tasks.keys():
+        if zone_id in zone_captures:
+            cap = zone_captures[zone_id]
+            if cap is _external_camera:
+                zones_using_external.append(zone_id)
+    
+    if zones_using_external:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Cannot stop external camera server: zones {zones_using_external} are still using it"
+        )
+    
+    if _external_camera_server is None:
+        return {"message": "External camera server is not running", "stopped": False}
+    
+    try:
+        # Stop the server
+        # Note: HTTPServer.shutdown() must be called from a different thread
+        # We'll use a simple approach: set a flag and let the server thread handle it
+        server_to_stop = _external_camera_server
+        
+        # Release camera first (before stopping server)
+        if _external_camera is not None:
+            try:
+                _external_camera.release()
+                print("[INFO] External camera released")
+            except Exception as e:
+                print(f"[ERROR] Error releasing camera: {e}")
+            _external_camera = None
+        
+        # Stop the server
+        if server_to_stop is not None:
+            try:
+                # Shutdown must be called from another thread
+                import threading
+                def shutdown_server():
+                    try:
+                        server_to_stop.shutdown()
+                    except Exception as e:
+                        print(f"[ERROR] Error in shutdown: {e}")
+                
+                shutdown_thread = threading.Thread(target=shutdown_server, daemon=True)
+                shutdown_thread.start()
+                shutdown_thread.join(timeout=1.0)
+                
+                try:
+                    server_to_stop.server_close()
+                except Exception as e:
+                    print(f"[ERROR] Error closing server: {e}")
+                
+                print("[INFO] External camera server stopped")
+            except Exception as e:
+                print(f"[ERROR] Error stopping server: {e}")
+        
+        _external_camera_server = None
+        
+        print("[INFO] External camera server stopped and camera released")
+        return {"message": "External camera server stopped", "stopped": True}
+    except Exception as e:
+        print(f"[ERROR] Error stopping external camera server: {e}")
+        raise HTTPException(status_code=500, detail=f"Error stopping external camera server: {str(e)}")
+
+
 # Pre-initialize detector on startup to avoid delays on first request
 def preload_detector():
     """Pre-load detector in background thread"""
@@ -1180,7 +1542,13 @@ if __name__ == "__main__":
         print(f"\n📹 Starting external camera server on port {args.external_camera_port}...")
         start_external_camera_server(args.external_camera_port, args.external_camera_index)
     elif args.external_camera_port > 0:
-        print(f"\n💡 Tip: Use --enable-external-camera to start external camera streaming server")
+        # Show what URL would be available if external camera server is enabled
+        local_ip = get_local_ip()
+        print(f"\n💡 External Camera Server (not started)")
+        print(f"   To enable: Use --enable-external-camera flag")
+        print(f"   If enabled, URLs would be:")
+        print(f"   - Local: http://localhost:{args.external_camera_port}/video")
+        print(f"   - Network: http://{local_ip}:{args.external_camera_port}/video")
     
     print(f"\n🌐 Starting AI service API on http://0.0.0.0:{args.port}")
     print("="*60 + "\n")

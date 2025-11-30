@@ -198,7 +198,7 @@ class _ProfilePageState extends ConsumerState<ProfilePage> {
                             const Divider(height: 1),
                             ListTile(
                               leading: const Icon(Icons.share),
-                              title: const Text('Device Sharing'),
+                              title: const Text('Camera Device Sharing'),
                               subtitle: const Text('Generate sharing codes and manage users'),
                               trailing: const Icon(Icons.chevron_right),
                               onTap: () {

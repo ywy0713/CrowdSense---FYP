@@ -28,14 +28,11 @@ class AIService {
     return '$base/zones/$zoneId/stream';
   }
 
-  /// Start monitoring a zone with direct camera access
+  /// Start monitoring a zone
   static Future<bool> startZoneMonitoring(String zoneId, ZoneData zone) async {
     try {
-      // Handle direct camera (use 0 for default camera)
+      // Get camera URL
       String cameraUrl = zone.cameraUrl ?? '';
-      if (cameraUrl == 'direct') {
-        cameraUrl = '0'; // Use 0 for default camera in OpenCV
-      }
 
       // Get base URL for current platform
       final serviceBaseUrl = baseUrl;
@@ -111,18 +108,23 @@ class AIService {
       final response = await http.post(
         Uri.parse('${baseUrl}/zones/$zoneId/stop'),
         headers: {'Content-Type': 'application/json'},
-      );
+      ).timeout(const Duration(seconds: 5));
 
       if (response.statusCode == 200) {
         print('✅ AI service stopped for zone: $zoneId');
         return true;
+      } else if (response.statusCode == 404) {
+        // Zone not in monitoring tasks - this is OK for HTTP mode using external streams
+        print('ℹ️ Zone $zoneId not in monitoring tasks (may be using external stream)');
+        return false; // Return false but don't treat as error
       } else {
         print('❌ Failed to stop AI service: ${response.statusCode}');
         return false;
       }
     } catch (e) {
+      // Re-throw to let caller handle (especially 404 for HTTP mode)
       print('⚠️ Error stopping AI service: $e');
-      return false;
+      rethrow;
     }
   }
 
@@ -138,6 +140,46 @@ class AIService {
     } catch (e) {
       print('⚠️ Error getting AI service status: $e');
       return null;
+    }
+  }
+
+  /// Stop external camera server
+  static Future<bool> stopExternalCameraServer() async {
+    try {
+      final response = await http.post(
+        Uri.parse('${baseUrl}/external-camera/stop'),
+        headers: {'Content-Type': 'application/json'},
+      ).timeout(const Duration(seconds: 5));
+
+      if (response.statusCode == 200) {
+        print('✅ External camera server stopped');
+        return true;
+      } else {
+        print('❌ Failed to stop external camera server: ${response.statusCode}');
+        return false;
+      }
+    } catch (e) {
+      print('⚠️ Error stopping external camera server: $e');
+      return false;
+    }
+  }
+
+  /// Check if HTTP URL is from external camera server
+  static bool isExternalCameraServerUrl(String? url) {
+    if (url == null || !url.startsWith('http')) return false;
+    try {
+      final uri = Uri.parse(url);
+      final isLocalhost = uri.host == 'localhost' || 
+                         uri.host == '127.0.0.1' || 
+                         uri.host == '0.0.0.0' ||
+                         uri.host.startsWith('192.168.') ||
+                         uri.host.startsWith('10.') ||
+                         uri.host.startsWith('172.');
+      final isVideoPath = uri.path == '/video' || uri.path.endsWith('/video');
+      final isPort8080 = uri.port == 8080;
+      return isLocalhost && isVideoPath && isPort8080;
+    } catch (e) {
+      return false;
     }
   }
 }

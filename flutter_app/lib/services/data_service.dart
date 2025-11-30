@@ -11,6 +11,8 @@ class ZoneData {
   final String? cameraUrl;
   final String? rtspUrl;
   final double? averageServiceSpeed;
+  final String? permission; // 'view' or 'edit' for shared zones, null for owned zones
+  final bool isShared; // true if this is a shared zone, false if owned
 
   ZoneData({
     required this.id,
@@ -21,6 +23,8 @@ class ZoneData {
     this.cameraUrl,
     this.rtspUrl,
     this.averageServiceSpeed,
+    this.permission,
+    this.isShared = false,
   });
 
   Map<String, dynamic> toMap() {
@@ -36,7 +40,7 @@ class ZoneData {
     };
   }
 
-  factory ZoneData.fromMap(String id, Map<dynamic, dynamic> map) {
+  factory ZoneData.fromMap(String id, Map<dynamic, dynamic> map, {String? permission, bool isShared = false}) {
     return ZoneData(
       id: id,
       name: map['name'] ?? '',
@@ -46,6 +50,8 @@ class ZoneData {
       cameraUrl: map['cameraUrl'],
       rtspUrl: map['rtspUrl'],
       averageServiceSpeed: map['averageServiceSpeed']?.toDouble(),
+      permission: permission,
+      isShared: isShared,
     );
   }
 }
@@ -191,33 +197,103 @@ class DataService {
   }
 
   // Zone management
-  static Future<ZoneData?> getZone(String zoneId) async {
+  static Future<ZoneData?> getZone(String zoneId, {String? userId}) async {
     try {
       final snapshot = await _database.child('zones/$zoneId').get();
       if (snapshot.exists) {
-        return ZoneData.fromMap(zoneId, Map<String, dynamic>.from(snapshot.value as Map));
+        // Check if this is a shared zone for the user
+        String? permission;
+        bool isShared = false;
+        if (userId != null) {
+          // Check if user owns the zone first
+          final ownedZoneSnapshot = await _database.child('users/$userId/zones/$zoneId').get();
+          if (!ownedZoneSnapshot.exists) {
+            // Not owned, check if shared
+            final sharedZoneSnapshot = await _database.child('users/$userId/sharedZones/$zoneId').get();
+            if (sharedZoneSnapshot.exists) {
+              final sharedData = Map<String, dynamic>.from(sharedZoneSnapshot.value as Map);
+              permission = sharedData['permission'] as String? ?? 'view';
+              isShared = true;
+            }
+          }
+        }
+        
+        return ZoneData.fromMap(
+          zoneId,
+          Map<String, dynamic>.from(snapshot.value as Map),
+          permission: permission,
+          isShared: isShared,
+        );
       }
       return null;
     } catch (e) {
       return null;
     }
   }
+  
+  /// Get permission for a zone (for current user)
+  /// Returns 'view', 'edit', or null (null means user owns the zone)
+  static Future<String?> getZonePermission(String userId, String zoneId) async {
+    try {
+      // Check if user owns the zone
+      final ownedZoneSnapshot = await _database.child('users/$userId/zones/$zoneId').get();
+      if (ownedZoneSnapshot.exists) {
+        return null; // Owner has full access (no permission restriction)
+      }
+      
+      // Check if zone is shared with user
+      final sharedZoneSnapshot = await _database.child('users/$userId/sharedZones/$zoneId').get();
+      if (sharedZoneSnapshot.exists) {
+        final sharedData = Map<String, dynamic>.from(sharedZoneSnapshot.value as Map);
+        return sharedData['permission'] as String? ?? 'view';
+      }
+      
+      return null; // User has no access
+    } catch (e) {
+      print('❌ Error getting zone permission: $e');
+      return null;
+    }
+  }
 
   static Future<List<ZoneData>> getUserZones(String userId) async {
     try {
-      final snapshot = await _database.child('users/$userId/zones').get();
-      if (!snapshot.exists) return [];
-
-      final zoneIds = Map<String, dynamic>.from(snapshot.value as Map).keys.toList();
       final zones = <ZoneData>[];
-
-      for (final zoneId in zoneIds) {
-        final zone = await getZone(zoneId);
-        if (zone != null) zones.add(zone);
+      
+      // Get zones owned by user
+      final ownedZonesSnapshot = await _database.child('users/$userId/zones').get();
+      if (ownedZonesSnapshot.exists) {
+        final zoneIds = Map<String, dynamic>.from(ownedZonesSnapshot.value as Map).keys.toList();
+        for (final zoneId in zoneIds) {
+          final zoneSnapshot = await _database.child('zones/$zoneId').get();
+          if (zoneSnapshot.exists) {
+            final zoneData = Map<dynamic, dynamic>.from(zoneSnapshot.value as Map);
+            final zone = ZoneData.fromMap(zoneId, zoneData, isShared: false);
+            zones.add(zone);
+          }
+        }
+      }
+      
+      // Get zones shared with user
+      final sharedZonesSnapshot = await _database.child('users/$userId/sharedZones').get();
+      if (sharedZonesSnapshot.exists) {
+        final sharedZonesData = Map<String, dynamic>.from(sharedZonesSnapshot.value as Map);
+        for (final entry in sharedZonesData.entries) {
+          final zoneId = entry.key;
+          final sharedZoneData = Map<String, dynamic>.from(entry.value as Map);
+          final permission = sharedZoneData['permission'] as String? ?? 'view';
+          
+          final zoneSnapshot = await _database.child('zones/$zoneId').get();
+          if (zoneSnapshot.exists) {
+            final zoneData = Map<dynamic, dynamic>.from(zoneSnapshot.value as Map);
+            final zone = ZoneData.fromMap(zoneId, zoneData, permission: permission, isShared: true);
+            zones.add(zone);
+          }
+        }
       }
 
       return zones;
     } catch (e) {
+      print('❌ Error getting user zones: $e');
       return [];
     }
   }
@@ -285,13 +361,33 @@ class DataService {
   }
 
   // Subscribe to zone data (count + thresholds)
-  static Stream<ZoneData?> subscribeToZone(String zoneId) {
+  static Stream<ZoneData?> subscribeToZone(String zoneId, {String? userId}) {
     return _database
         .child('zones/$zoneId')
         .onValue
-        .map((event) {
+        .asyncMap((event) async {
       if (event.snapshot.exists) {
-        return ZoneData.fromMap(zoneId, Map<String, dynamic>.from(event.snapshot.value as Map));
+        // Check permission if userId provided
+        String? permission;
+        bool isShared = false;
+        if (userId != null) {
+          final ownedZoneSnapshot = await _database.child('users/$userId/zones/$zoneId').get();
+          if (!ownedZoneSnapshot.exists) {
+            final sharedZoneSnapshot = await _database.child('users/$userId/sharedZones/$zoneId').get();
+            if (sharedZoneSnapshot.exists) {
+              final sharedData = Map<String, dynamic>.from(sharedZoneSnapshot.value as Map);
+              permission = sharedData['permission'] as String? ?? 'view';
+              isShared = true;
+            }
+          }
+        }
+        
+        return ZoneData.fromMap(
+          zoneId,
+          Map<String, dynamic>.from(event.snapshot.value as Map),
+          permission: permission,
+          isShared: isShared,
+        );
       }
       return null;
     });

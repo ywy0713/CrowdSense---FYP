@@ -9,6 +9,9 @@ import 'package:http/http.dart' as http;
 import '../../services/auth_service.dart';
 import '../../services/data_service.dart';
 import '../../services/ai_service.dart';
+import '../../services/local_camera_service.dart';
+import '../../services/local_ai_service.dart';
+import '../../services/firebase_monitoring_service.dart';
 import '../../theme/app_theme.dart';
 import '../../components/bottom_nav.dart';
 import '../../providers/active_camera_provider.dart';
@@ -50,9 +53,7 @@ class _VideoSurveillancePageState extends ConsumerState<VideoSurveillancePage> {
   @override
   void dispose() {
     // Dispose all controllers
-    for (var controller in _webViewControllers.values) {
-      // WebView controllers don't need explicit disposal
-    }
+    _webViewControllers.clear(); // WebView controllers don't need explicit disposal
     for (var controller in _videoPlayerControllers.values) {
       controller.dispose();
     }
@@ -74,11 +75,14 @@ class _VideoSurveillancePageState extends ConsumerState<VideoSurveillancePage> {
     _zoneSubscriptions.clear();
     _apiPollingSubscriptions.clear();
     
+    // Dispose local services
+    LocalCameraService.dispose();
+    LocalAIService.dispose();
+    
     // Note: AI service monitoring continues in background
     super.dispose();
   }
 
-  // Note: Direct camera uses Python service stream, no local camera initialization needed
 
   Future<void> _loadZones() async {
     setState(() {
@@ -90,10 +94,10 @@ class _VideoSurveillancePageState extends ConsumerState<VideoSurveillancePage> {
       if (user != null) {
         final zones = await DataService.getUserZones(user.uid);
         
-        // Check for active cameras
+        // Check for active cameras from provider (includes local and HTTP modes)
         final activeCameras = ref.read(activeCameraProvider);
         
-        // Check which zones are actually active in Python service
+        // Check which zones are actually active in Python service (for HTTP mode only)
         List<String> actuallyActiveZones = [];
         try {
           final status = await AIService.getStatus();
@@ -106,24 +110,40 @@ class _VideoSurveillancePageState extends ConsumerState<VideoSurveillancePage> {
           print('⚠️ Failed to check active zones: $e');
         }
         
+        // Also check Firebase monitoring status for all zones (includes local mode)
+        Set<String> firebaseActiveZones = {};
+        for (var zone in zones) {
+          try {
+            final isMonitoring = await FirebaseMonitoringService.getMonitoringStatus(zone.id);
+            if (isMonitoring) {
+              firebaseActiveZones.add(zone.id);
+            }
+          } catch (e) {
+            print('⚠️ Failed to check Firebase monitoring status for ${zone.id}: $e');
+          }
+        }
+        
+        // Combine active zones: from provider, Firebase, and Python service
+        final allActiveZones = activeCameras.union(firebaseActiveZones).union(actuallyActiveZones.toSet());
+        
         setState(() {
           _zones = zones;
           if (zones.isNotEmpty) {
-            // Only select from actually active zones
-            if (actuallyActiveZones.isNotEmpty) {
-              // Prefer active camera from provider if available and actually active
+            // Select from all active zones (local, HTTP, or Python service)
+            if (allActiveZones.isNotEmpty) {
+              // Prefer active camera from provider if available
               if (activeCameras.isNotEmpty) {
                 final firstActive = activeCameras.first;
-                if (actuallyActiveZones.contains(firstActive) && zones.any((z) => z.id == firstActive)) {
+                if (allActiveZones.contains(firstActive) && zones.any((z) => z.id == firstActive)) {
                   _selectedZoneId = firstActive;
-                } else if (actuallyActiveZones.isNotEmpty) {
-                  // Use first actually active zone
-                  _selectedZoneId = actuallyActiveZones.first;
+                } else if (allActiveZones.isNotEmpty) {
+                  // Use first active zone from any source
+                  _selectedZoneId = allActiveZones.first;
                 } else {
                   _selectedZoneId = null;
                 }
-              } else if (actuallyActiveZones.isNotEmpty) {
-                _selectedZoneId = actuallyActiveZones.first;
+              } else if (allActiveZones.isNotEmpty) {
+                _selectedZoneId = allActiveZones.first;
               } else {
                 _selectedZoneId = null;
               }
@@ -145,8 +165,8 @@ class _VideoSurveillancePageState extends ConsumerState<VideoSurveillancePage> {
           _isLoading = false;
         });
         
-        // Subscribe to real-time people count updates for active zones only
-        for (var zoneId in actuallyActiveZones) {
+        // Subscribe to real-time people count updates for all active zones
+        for (var zoneId in allActiveZones) {
           _subscribeToPeopleCount(zoneId);
         }
       }
@@ -159,12 +179,24 @@ class _VideoSurveillancePageState extends ConsumerState<VideoSurveillancePage> {
 
   Future<List<String>> _getActiveZones() async {
     try {
-      final status = await AIService.getStatus();
-      if (status != null) {
-        return (status['active_zones'] as List<dynamic>? ?? [])
-            .map((e) => e.toString())
-            .toList();
+      // Get active zones from Firebase (includes local and HTTP modes)
+      final firebaseActiveZones = await FirebaseMonitoringService.getActiveZones();
+      
+      // Also get active zones from Python service (for HTTP mode)
+      List<String> pythonActiveZones = [];
+      try {
+        final status = await AIService.getStatus();
+        if (status != null) {
+          pythonActiveZones = (status['active_zones'] as List<dynamic>? ?? [])
+              .map((e) => e.toString())
+              .toList();
+        }
+      } catch (e) {
+        print('⚠️ Failed to get Python active zones: $e');
       }
+      
+      // Combine both sources
+      return firebaseActiveZones.toSet().union(pythonActiveZones.toSet()).toList();
     } catch (e) {
       print('⚠️ Failed to get active zones: $e');
     }
@@ -173,8 +205,72 @@ class _VideoSurveillancePageState extends ConsumerState<VideoSurveillancePage> {
 
   Future<void> _deactivateCamera(String zoneId) async {
     try {
-      // Stop AI service monitoring
-      await AIService.stopZoneMonitoring(zoneId);
+      // Get zone to check if it's local mode
+      final zone = _zones.firstWhere((z) => z.id == zoneId, orElse: () => _zones.first);
+      final isLocalMode = zone.cameraUrl == 'local';
+      final isHttpMode = zone.cameraUrl != null && zone.cameraUrl!.startsWith('http');
+      
+      if (isLocalMode) {
+        // Local mode - stop camera preview and dispose resources
+        await LocalCameraService.stopPreview();
+        await LocalCameraService.dispose();
+        LocalAIService.dispose();
+        // Update Firebase monitoring status
+        await FirebaseMonitoringService.setMonitoringStatus(zoneId, false);
+      } else if (isHttpMode) {
+        // HTTP mode - stop Python AI service to release camera
+        try {
+          final success = await AIService.stopZoneMonitoring(zoneId);
+          if (!success) {
+            print('ℹ️ HTTP mode zone $zoneId may not have Python monitoring task (this is OK if using external stream)');
+          } else {
+            print('✅ Python service stopped successfully for zone $zoneId');
+          }
+        } catch (e) {
+          // Handle 404 error gracefully for HTTP mode (zone may not be in monitoring_tasks)
+          if (e.toString().contains('404')) {
+            print('ℹ️ HTTP mode zone $zoneId not in Python monitoring tasks (using external stream, this is OK)');
+          } else {
+            print('⚠️ Error stopping Python service: $e');
+          }
+        }
+        
+        // Check if using external camera server and stop it if no other zones are using it
+        // IMPORTANT: Don't stop external camera server immediately - it will be stopped
+        // by Python service's stop_monitoring endpoint if no zones are using it
+        // This prevents issues with rapid deactivate/activate cycles
+        if (AIService.isExternalCameraServerUrl(zone.cameraUrl)) {
+          try {
+            // Check if any other zones are using external camera server
+            // Check both Firebase and Python service status
+            final activeZones = await FirebaseMonitoringService.getActiveZones();
+            final otherZonesUsingExternal = activeZones.where((id) => id != zoneId).toList();
+            
+            // Also check Python service for active monitoring tasks
+            final pythonStatus = await AIService.getStatus();
+            final pythonActiveZones = pythonStatus?['active_zones'] as List<dynamic>? ?? [];
+            final pythonOtherZones = pythonActiveZones.where((id) => id.toString() != zoneId).toList();
+            
+            if (otherZonesUsingExternal.isEmpty && pythonOtherZones.isEmpty) {
+              // No other zones using external camera server, stop it
+              // But wait a bit to ensure monitoring task is fully stopped
+              await Future.delayed(const Duration(milliseconds: 500));
+              print('🛑 Stopping external camera server as no other zones are using it');
+              await AIService.stopExternalCameraServer();
+            } else {
+              print('ℹ️ Other zones are using external camera server, keeping it running');
+              print('   Firebase active zones: $otherZonesUsingExternal');
+              print('   Python active zones: $pythonOtherZones');
+            }
+          } catch (e) {
+            print('⚠️ Error checking/stopping external camera server: $e');
+            // Don't fail deactivation if external camera server check fails
+          }
+        }
+        
+        // Update Firebase monitoring status
+        await FirebaseMonitoringService.setMonitoringStatus(zoneId, false);
+      }
       
       // Remove from active cameras
       ref.read(activeCameraProvider.notifier).removeActiveCamera(zoneId);
@@ -354,59 +450,82 @@ class _VideoSurveillancePageState extends ConsumerState<VideoSurveillancePage> {
     // Flutter just displays the MJPEG stream from Python service
     // Python service runs on host machine, not on device
 
-    try {
-      // Check if controller already exists for this zone
-      if (_webViewControllers.containsKey(zoneId)) {
-        print('✅ WebView controller already exists for zone $zoneId');
-        setState(() {
-          _streamingStatus[zoneId] = true;
-        });
-        return;
-      }
-
-      // Verify Python service is running and zone is active
-      // DO NOT activate here - activation must be done from Camera Setup page
+    // Check if using local mode or HTTP mode
+    // Check camera mode: local uses Flutter camera, HTTP uses Python service
+    final isLocalMode = zone.cameraUrl == 'local';
+    final isHttpMode = zone.cameraUrl != null && zone.cameraUrl!.startsWith('http');
+    
+    if (isLocalMode) {
+      // Local mode - use device camera directly
+      print('📱 Setting up local camera for zone $zoneId');
       try {
-        final status = await AIService.getStatus();
-        if (status == null) {
-          throw Exception('Python AI service is not running. Please start it first.');
-        }
-        final activeZones = (status['active_zones'] as List<dynamic>? ?? [])
-            .map((e) => e.toString())
-            .toList();
-        if (!activeZones.contains(zoneId)) {
-          // Zone is not active - show error and redirect to camera setup
-          print('⚠️ Zone $zoneId is not active. Please activate it from Camera Setup page first.');
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: const Text('Camera is not active. Please activate it from Camera Setup page first.'),
-                backgroundColor: Colors.orange,
-                duration: const Duration(seconds: 5),
-                action: SnackBarAction(
-                  label: 'Go to Setup',
-                  textColor: Colors.white,
-                  onPressed: () {
-                    // Use microtask to ensure SnackBar closes before navigation
-                    Future.microtask(() {
-                      if (mounted) {
-                        context.go('/camera-setup');
-                      }
-                    });
-                  },
-                ),
-              ),
-            );
-          }
+        // Check if controller already exists
+        if (_cameraControllers.containsKey(zoneId)) {
+          print('✅ Camera controller already exists for zone $zoneId');
+          setState(() {
+            _streamingStatus[zoneId] = true;
+          });
           return;
         }
-        print('✅ Python AI service is running for zone: $zoneId');
+
+        // Initialize local camera if not already initialized
+        if (!LocalCameraService.isInitialized) {
+          final initialized = await LocalCameraService.initialize();
+          if (!initialized) {
+            throw Exception('Failed to initialize local camera');
+          }
+        }
+        
+        // Start preview
+        final previewStarted = await LocalCameraService.startPreview();
+        if (!previewStarted) {
+          throw Exception('Failed to start camera preview');
+        }
+        
+            // Set up detection callback
+            LocalAIService.setDetectionCallback((count, confidence) {
+              // Update people count in Firebase and local state
+              if (mounted) {
+                setState(() {
+                  _peopleCounts[zoneId] = count;
+                });
+                // Update Firebase using FirebaseMonitoringService (for dashboard and analytics)
+                FirebaseMonitoringService.updatePeopleCount(zoneId, count).catchError((e) {
+                  print('❌ Error updating people count to Firebase: $e');
+                });
+                // Also update via DataService for compatibility
+                DataService.updatePeopleCount(zoneId, count).catchError((e) {
+                  print('❌ Error updating people count via DataService: $e');
+                });
+              }
+            });
+        
+        // Initialize local AI service
+        await LocalAIService.initialize();
+        
+        // Set image callback for processing
+        LocalCameraService.setImageCallback((image) {
+          LocalAIService.processImage(image);
+        });
+        
+        // Store camera controller reference
+        final cameraController = LocalCameraService.controller;
+        if (cameraController != null) {
+          _cameraControllers[zoneId] = cameraController;
+        }
+        
+        if (mounted) {
+          setState(() {
+            _streamingStatus[zoneId] = true;
+          });
+        }
+        print('✅ Local camera initialized for zone $zoneId');
       } catch (e) {
-        print('❌ Error checking Python service: $e');
+        print('❌ Failed to initialize local camera for zone $zoneId: $e');
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
-              content: Text('Error: Python AI service not available. Please ensure it is running at ${AIService.baseUrl}'),
+              content: Text('Failed to initialize local camera: $e'),
               backgroundColor: Colors.red,
               duration: const Duration(seconds: 5),
             ),
@@ -414,192 +533,204 @@ class _VideoSurveillancePageState extends ConsumerState<VideoSurveillancePage> {
         }
         return;
       }
+    } else if (isHttpMode) {
+      // HTTP mode - use Python service stream
+      try {
+        // Check if controller already exists for this zone
+        if (_webViewControllers.containsKey(zoneId)) {
+          print('✅ WebView controller already exists for zone $zoneId');
+          setState(() {
+            _streamingStatus[zoneId] = true;
+          });
+          return;
+        }
 
-      // Wait a bit for Python service to initialize camera (if not already started)
-      print('⏳ Waiting for Python AI service to initialize camera...');
-      await Future.delayed(const Duration(seconds: 1));
-
-      if (zone.cameraUrl == 'direct' || (zone.cameraUrl != null && zone.cameraUrl!.isNotEmpty)) {
-        // For direct camera, use Python service's video stream to avoid camera conflict
-        // Python service handles the camera access and provides MJPEG stream
-        // Wait a bit for Python service to start camera (if not already started)
-        print('⏳ Waiting for Python AI service to initialize camera...');
-        await Future.delayed(const Duration(seconds: 2));
+        // For HTTP mode, use Python service's stream endpoint instead of direct URL
+        // This ensures proper MJPEG streaming and frame availability
+        final streamUrl = AIService.getStreamUrl(zoneId);
+        print('📱 Setting up HTTP stream via WebView for zone $zoneId');
+        print('   Using Python service stream: $streamUrl');
+        print('   Original camera URL: ${zone.cameraUrl}');
         
-        // Verify Python service is running and zone is already active
-        // NOTE: This page can only VIEW streams, not activate cameras
-        // Camera activation must be done from Camera Setup page
-        try {
-          final status = await AIService.getStatus();
-          if (status == null) {
-            throw Exception('Python AI service is not running. Please start it first.');
-          }
-          final activeZones = status['active_zones'] as List<dynamic>? ?? [];
-          if (!activeZones.contains(zone.id)) {
-            // Zone is not active - show error and redirect to camera setup
-            print('⚠️ Zone ${zone.id} is not active. Please activate it from Camera Setup page first.');
+        // Create HTML wrapper for MJPEG stream
+        // Escape the URL properly for HTML
+        final escapedUrl = streamUrl.replaceAll("'", "\\'").replaceAll('"', '&quot;');
+        final htmlContent = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Camera Stream</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            background-color: #000;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            overflow: hidden;
+        }
+        #stream-container {
+            width: 100%;
+            height: 100%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        #stream-img {
+            max-width: 100%;
+            max-height: 100%;
+            width: auto;
+            height: auto;
+            object-fit: contain;
+        }
+        .error {
+            color: #fff;
+            text-align: center;
+            padding: 20px;
+            font-family: Arial, sans-serif;
+        }
+    </style>
+</head>
+<body>
+    <div id="stream-container">
+        <img id="stream-img" src="$escapedUrl" alt="Camera Stream" />
+    </div>
+    <script>
+        const img = document.getElementById('stream-img');
+        const container = document.getElementById('stream-container');
+        const streamUrl = '$escapedUrl';
+        
+        // Handle image load
+        img.onload = function() {
+            console.log('Stream image loaded');
+        };
+        
+        // Handle image errors with retry
+        img.onerror = function() {
+            console.error('Stream image error, retrying...');
+            // Retry loading with cache buster
+            setTimeout(function() {
+                img.src = streamUrl + (streamUrl.indexOf('?') === -1 ? '?' : '&') + 't=' + Date.now();
+            }, 1000);
+        };
+        
+        // Periodically refresh to ensure stream stays alive
+        setInterval(function() {
+            img.src = streamUrl + (streamUrl.indexOf('?') === -1 ? '?' : '&') + 't=' + Date.now();
+        }, 30000); // Refresh every 30 seconds
+    </script>
+</body>
+</html>
+''';
+        
+        final webViewController = WebViewController()
+          ..setJavaScriptMode(JavaScriptMode.unrestricted)
+          ..setBackgroundColor(Colors.black)
+          ..setNavigationDelegate(
+            NavigationDelegate(
+              onPageStarted: (String url) {
+                print('📱 WebView page started for zone $zoneId: $url');
+              },
+              onPageFinished: (String url) {
+                print('✅ WebView page finished for zone $zoneId: $url');
+              },
+              onWebResourceError: (WebResourceError error) {
+                print('❌ WebView error for zone $zoneId: ${error.description} (code: ${error.errorCode})');
+                if (mounted && error.errorCode != -2 && error.errorCode != -6) {
+                  if (!_hasShownStreamError) {
+                    _hasShownStreamError = true;
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text('Failed to load HTTP stream for ${zone.name}: ${error.description}'),
+                        backgroundColor: Colors.red,
+                        duration: const Duration(seconds: 5),
+                      ),
+                    );
+                    Future.delayed(const Duration(seconds: 10), () {
+                      if (mounted) {
+                        _hasShownStreamError = false;
+                      }
+                    });
+                  }
+                }
+              },
+            ),
+          )
+          ..loadHtmlString(htmlContent, baseUrl: streamUrl);
+        
+        _webViewControllers[zoneId] = webViewController;
+        
+        if (mounted) {
+          setState(() {
+            _streamingStatus[zoneId] = true;
+          });
+        }
+        print('✅ HTTP stream initialized with WebView for zone $zoneId');
+      } catch (e) {
+        print('❌ Error setting up HTTP stream: $e');
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Failed to setup HTTP stream: $e'),
+              backgroundColor: Colors.red,
+              duration: const Duration(seconds: 5),
+            ),
+          );
+        }
+        return;
+      }
+    } else if (zone.rtspUrl != null && zone.rtspUrl!.isNotEmpty && 
+               !zone.rtspUrl!.startsWith('http://') && !zone.rtspUrl!.startsWith('https://')) {
+          // Use RTSP stream (only if it's actually RTSP, not HTTP)
+          print('📹 Setting up RTSP stream via VideoPlayer for zone $zoneId: ${zone.rtspUrl}');
+          try {
+            final videoPlayerController = VideoPlayerController.networkUrl(
+              Uri.parse(zone.rtspUrl!),
+              videoPlayerOptions: VideoPlayerOptions(
+                allowBackgroundPlayback: false,
+              ),
+            );
+            await videoPlayerController.initialize().timeout(
+              const Duration(seconds: 10),
+              onTimeout: () {
+                throw TimeoutException('Video player initialization timeout');
+              },
+            );
+            videoPlayerController.setLooping(true);
+            videoPlayerController.play();
+            
+            // Store controller for this zone
+            _videoPlayerControllers[zoneId] = videoPlayerController;
+            
+            if (mounted) {
+              setState(() {
+                _streamingStatus[zoneId] = true;
+              });
+            }
+            print('✅ RTSP stream initialized with VideoPlayer for zone $zoneId');
+          } catch (e) {
+            print('❌ Failed to initialize RTSP stream for zone $zoneId: $e');
             if (mounted) {
               ScaffoldMessenger.of(context).showSnackBar(
                 SnackBar(
-                  content: const Text('Camera is not active. Please activate it from Camera Setup page first.'),
-                  backgroundColor: Colors.orange,
+                  content: Text('Failed to start RTSP stream for ${zone.name}: $e'),
+                  backgroundColor: Colors.red,
                   duration: const Duration(seconds: 5),
-                  action: SnackBarAction(
-                    label: 'Go to Setup',
-                    textColor: Colors.white,
-                    onPressed: () {
-                      // Use microtask to ensure SnackBar closes before navigation
-                      Future.microtask(() {
-                        if (mounted) {
-                          context.go('/camera-setup');
-                        }
-                      });
-                    },
-                  ),
                 ),
               );
             }
             return;
           }
-          print('✅ Python AI service is running for zone: ${zone.id}');
-        } catch (e) {
-          print('❌ Error checking Python service: $e');
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text('Error: Python AI service not available. Please ensure it is running at ${AIService.baseUrl}'),
-                backgroundColor: Colors.red,
-                duration: const Duration(seconds: 5),
-              ),
-            );
-          }
-          return;
-        }
-        
-        // Use unified HTML page approach for Mobile
-        // Python service provides /zones/{zone_id}/view endpoint with HTML page
-        final baseUrl = AIService.baseUrl;
-        final viewUrl = '$baseUrl/zones/$zoneId/view';
-        
-        // Mobile: Use WebView to display HTML page with MJPEG stream
-        print('📱 Setting up video stream via WebView for zone $zoneId: $viewUrl');
-        try {
-          final webViewController = WebViewController()
-            ..setJavaScriptMode(JavaScriptMode.unrestricted)
-            ..setBackgroundColor(Colors.black)
-            ..setNavigationDelegate(
-              NavigationDelegate(
-                onPageStarted: (String url) {
-                  print('📱 WebView page started for zone $zoneId: $url');
-                },
-                onPageFinished: (String url) {
-                  print('✅ WebView page finished for zone $zoneId: $url');
-                },
-                onWebResourceError: (WebResourceError error) {
-                  print('❌ WebView error for zone $zoneId: ${error.description} (code: ${error.errorCode})');
-                  // Only show error for critical failures (not 404s or network timeouts that might be transient)
-                  if (mounted && error.errorCode != -2 && error.errorCode != -6) {
-                    // Avoid showing multiple error messages
-                    if (!_hasShownStreamError) {
-                      _hasShownStreamError = true;
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(
-                          content: Text('Failed to load video stream for ${zone.name}: ${error.description}'),
-                          backgroundColor: Colors.red,
-                          duration: const Duration(seconds: 5),
-                        ),
-                      );
-                      // Reset flag after 10 seconds to allow showing error again if needed
-                      Future.delayed(const Duration(seconds: 10), () {
-                        if (mounted) {
-                          _hasShownStreamError = false;
-                        }
-                      });
-                    }
-                  }
-                },
-              ),
-            )
-            ..loadRequest(Uri.parse(viewUrl));
-          
-          // Store controller for this zone
-          _webViewControllers[zoneId] = webViewController;
-          
-          if (mounted) {
-            setState(() {
-              _streamingStatus[zoneId] = true;
-            });
-          }
-          print('✅ Video stream initialized with WebView for zone $zoneId');
-        } catch (e) {
-          print('❌ Failed to initialize WebView for zone $zoneId: $e');
-          
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text('Failed to initialize video stream for ${zone.name}: $e'),
-                backgroundColor: Colors.red,
-                duration: const Duration(seconds: 5),
-              ),
-            );
-          }
-          return;
-        }
-      } else if (zone.rtspUrl != null && zone.rtspUrl!.isNotEmpty && 
-                 !zone.rtspUrl!.startsWith('http://') && !zone.rtspUrl!.startsWith('https://')) {
-        // Use RTSP stream (only if it's actually RTSP, not HTTP)
-        print('📹 Setting up RTSP stream via VideoPlayer for zone $zoneId: ${zone.rtspUrl}');
-        try {
-          final videoPlayerController = VideoPlayerController.networkUrl(
-            Uri.parse(zone.rtspUrl!),
-            videoPlayerOptions: VideoPlayerOptions(
-              allowBackgroundPlayback: false,
-            ),
-          );
-          await videoPlayerController.initialize().timeout(
-            const Duration(seconds: 10),
-            onTimeout: () {
-              throw TimeoutException('Video player initialization timeout');
-            },
-          );
-          videoPlayerController.setLooping(true);
-          videoPlayerController.play();
-          
-          // Store controller for this zone
-          _videoPlayerControllers[zoneId] = videoPlayerController;
-          
-          if (mounted) {
-            setState(() {
-              _streamingStatus[zoneId] = true;
-            });
-          }
-          print('✅ RTSP stream initialized with VideoPlayer for zone $zoneId');
-        } catch (e) {
-          print('❌ Failed to initialize RTSP stream for zone $zoneId: $e');
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text('Failed to start RTSP stream for ${zone.name}: $e'),
-                backgroundColor: Colors.red,
-                duration: const Duration(seconds: 5),
-              ),
-            );
-          }
-          return;
-        }
-      } else {
-        throw Exception('No camera URL configured');
-      }
-    } catch (e) {
-      print('Error starting stream: $e');
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Failed to start stream: $e'),
-            backgroundColor: Colors.red,
-          ),
-        );
-      }
+    } else {
+      // No valid camera configuration
+      throw Exception('No camera URL configured');
     }
   }
 
@@ -685,8 +816,9 @@ class _VideoSurveillancePageState extends ConsumerState<VideoSurveillancePage> {
                   : SafeArea(
                       child: Column(
                         children: [
-                          // Video stream area
-                          Expanded(
+                          // Video stream area - use Flexible instead of Expanded to allow tab bar to be visible
+                          Flexible(
+                            flex: 3,
                             child: Container(
                               margin: const EdgeInsets.all(16),
                               decoration: BoxDecoration(
@@ -694,103 +826,110 @@ class _VideoSurveillancePageState extends ConsumerState<VideoSurveillancePage> {
                                 borderRadius: BorderRadius.circular(12),
                                 border: Border.all(color: AppTheme.border),
                               ),
-                              child: _selectedZoneId != null && _streamingStatus[_selectedZoneId] == true
-                                  ? Stack(
-                                      children: [
-                                        _buildVideoView(),
-                                        // People count overlay
-                                        Positioned(
-                                          top: 16,
-                                          left: 16,
-                                          child: Container(
-                                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                                            decoration: BoxDecoration(
-                                              color: Colors.black.withValues(alpha: 0.7),
-                                              borderRadius: BorderRadius.circular(8),
-                                            ),
-                                            child: Row(
-                                              mainAxisSize: MainAxisSize.min,
-                                              children: [
-                                                const Icon(
-                                                  Icons.people,
-                                                  color: Colors.white,
-                                                  size: 20,
-                                                ),
-                                                const SizedBox(width: 8),
-                                                Text(
-                                                  'People detected: ${_peopleCounts[_selectedZoneId] ?? 0}',
-                                                  style: const TextStyle(
-                                                    color: Colors.white,
-                                                    fontSize: 16,
-                                                    fontWeight: FontWeight.bold,
-                                                  ),
-                                                ),
-                                              ],
-                                            ),
-                                          ),
-                                        ),
-                                        // Zone name overlay
-                                        Positioned(
-                                          top: 16,
-                                          right: 16,
-                                          child: Container(
-                                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                                            decoration: BoxDecoration(
-                                              color: Colors.black.withValues(alpha: 0.7),
-                                              borderRadius: BorderRadius.circular(8),
-                                            ),
-                                            child: Text(
-                                              _zones.firstWhere((z) => z.id == _selectedZoneId, orElse: () => _zones.first).name,
-                                              style: const TextStyle(
-                                                color: Colors.white,
-                                                fontSize: 16,
-                                                fontWeight: FontWeight.bold,
-                                              ),
-                                            ),
-                                          ),
-                                        ),
-                                        // Deactivate button overlay (bottom right)
-                                        if (_selectedZoneId != null)
-                                          Positioned(
-                                            bottom: 16,
-                                            right: 16,
-                                            child: ElevatedButton.icon(
-                                              onPressed: () => _deactivateCamera(_selectedZoneId!),
-                                              icon: const Icon(Icons.stop, size: 18),
-                                              label: const Text('Deactivate'),
-                                              style: ElevatedButton.styleFrom(
-                                                backgroundColor: AppTheme.destructive,
-                                                foregroundColor: Colors.white,
-                                                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                                              ),
-                                            ),
-                                          ),
-                                      ],
-                                    )
-                                  : Center(
-                                      child: Column(
-                                        mainAxisAlignment: MainAxisAlignment.center,
+                              child: ClipRRect(
+                                borderRadius: BorderRadius.circular(12),
+                                child: _selectedZoneId != null && _streamingStatus[_selectedZoneId] == true
+                                    ? Stack(
                                         children: [
-                                          const CircularProgressIndicator(),
-                                          const SizedBox(height: 16),
-                                          Text(
-                                            'Initializing stream...',
-                                            style: TextStyle(
-                                              fontSize: 16,
-                                              color: AppTheme.foreground,
+                                          _buildVideoView(),
+                                          // People count overlay
+                                          Positioned(
+                                            top: 16,
+                                            left: 16,
+                                            child: Container(
+                                              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                                              decoration: BoxDecoration(
+                                                color: Colors.black.withValues(alpha: 0.7),
+                                                borderRadius: BorderRadius.circular(8),
+                                              ),
+                                              child: Row(
+                                                mainAxisSize: MainAxisSize.min,
+                                                children: [
+                                                  const Icon(
+                                                    Icons.people,
+                                                    color: Colors.white,
+                                                    size: 20,
+                                                  ),
+                                                  const SizedBox(width: 8),
+                                                  Text(
+                                                    'People detected: ${_peopleCounts[_selectedZoneId] ?? 0}',
+                                                    style: const TextStyle(
+                                                      color: Colors.white,
+                                                      fontSize: 16,
+                                                      fontWeight: FontWeight.bold,
+                                                    ),
+                                                  ),
+                                                ],
+                                              ),
                                             ),
                                           ),
+                                          // Zone name overlay
+                                          Positioned(
+                                            top: 16,
+                                            right: 16,
+                                            child: Container(
+                                              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                                              decoration: BoxDecoration(
+                                                color: Colors.black.withValues(alpha: 0.7),
+                                                borderRadius: BorderRadius.circular(8),
+                                              ),
+                                              child: Text(
+                                                _zones.firstWhere((z) => z.id == _selectedZoneId, orElse: () => _zones.first).name,
+                                                style: const TextStyle(
+                                                  color: Colors.white,
+                                                  fontSize: 16,
+                                                  fontWeight: FontWeight.bold,
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                          // Deactivate button overlay (bottom right)
+                                          if (_selectedZoneId != null)
+                                            Positioned(
+                                              bottom: 16,
+                                              right: 16,
+                                              child: ElevatedButton.icon(
+                                                onPressed: () => _deactivateCamera(_selectedZoneId!),
+                                                icon: const Icon(Icons.stop, size: 18),
+                                                label: const Text('Deactivate'),
+                                                style: ElevatedButton.styleFrom(
+                                                  backgroundColor: AppTheme.destructive,
+                                                  foregroundColor: Colors.white,
+                                                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                                                ),
+                                              ),
+                                            ),
                                         ],
+                                      )
+                                    : Center(
+                                        child: Column(
+                                          mainAxisAlignment: MainAxisAlignment.center,
+                                          children: [
+                                            const CircularProgressIndicator(),
+                                            const SizedBox(height: 16),
+                                            Text(
+                                              'Initializing stream...',
+                                              style: TextStyle(
+                                                fontSize: 16,
+                                                color: AppTheme.foreground,
+                                              ),
+                                            ),
+                                          ],
+                                        ),
                                       ),
-                                    ),
+                              ),
                             ),
                           ),
                           // Camera switcher (horizontal scrollable tabs) - only show active cameras
                           FutureBuilder<List<String>>(
                             future: _getActiveZones(),
                             builder: (context, snapshot) {
-                              final activeZones = snapshot.data ?? [];
-                              final activeZonesList = _zones.where((z) => activeZones.contains(z.id)).toList();
+                              // Get active zones from multiple sources
+                              final pythonActiveZones = snapshot.data ?? [];
+                              final activeCameras = ref.read(activeCameraProvider);
+                              final allActiveZones = pythonActiveZones.toSet().union(activeCameras);
+                              
+                              final activeZonesList = _zones.where((z) => allActiveZones.contains(z.id)).toList();
                               
                               if (activeZonesList.isEmpty) {
                                 return const SizedBox.shrink();
@@ -879,9 +1018,34 @@ class _VideoSurveillancePageState extends ConsumerState<VideoSurveillancePage> {
       return const Center(child: CircularProgressIndicator());
     }
     
-    // Use WebView for mobile platforms (preferred method)
+    final zone = _zones.firstWhere(
+      (z) => z.id == _selectedZoneId,
+      orElse: () => _zones.first,
+    );
+    
+    // Check if using local mode
+    final isLocalMode = zone.cameraUrl == 'local';
+    
+    // Use CameraPreview for local mode
+    if (isLocalMode && _cameraControllers.containsKey(_selectedZoneId)) {
+      final controller = _cameraControllers[_selectedZoneId]!;
+      if (controller.value.isInitialized) {
+        // Use AspectRatio to maintain camera aspect ratio and center it
+        final aspectRatio = controller.value.aspectRatio;
+        return Center(
+          child: AspectRatio(
+            aspectRatio: aspectRatio,
+            child: CameraPreview(controller),
+          ),
+        );
+      }
+    }
+    
+    // Use WebView for remote streams (preferred method)
     if (_webViewControllers.containsKey(_selectedZoneId)) {
-      return WebViewWidget(controller: _webViewControllers[_selectedZoneId]!);
+      return SizedBox.expand(
+        child: WebViewWidget(controller: _webViewControllers[_selectedZoneId]!),
+      );
     }
     
     // Fallback: Use VideoPlayer for RTSP streams
@@ -895,14 +1059,6 @@ class _VideoSurveillancePageState extends ConsumerState<VideoSurveillancePage> {
       }
     }
     
-    // Fallback: Use CameraPreview (if available)
-    if (_cameraControllers.containsKey(_selectedZoneId)) {
-      final controller = _cameraControllers[_selectedZoneId]!;
-      if (controller.value.isInitialized) {
-        return CameraPreview(controller);
-      }
-    }
-    
     // Loading state
     return Center(
       child: Column(
@@ -911,7 +1067,7 @@ class _VideoSurveillancePageState extends ConsumerState<VideoSurveillancePage> {
           const CircularProgressIndicator(),
           const SizedBox(height: 16),
           Text(
-            'Initializing stream for ${_zones.firstWhere((z) => z.id == _selectedZoneId, orElse: () => _zones.first).name}...',
+            'Initializing stream for ${zone.name}...',
             style: TextStyle(color: AppTheme.foreground),
           ),
         ],

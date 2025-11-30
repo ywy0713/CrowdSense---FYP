@@ -10,6 +10,7 @@ import 'package:flutter/services.dart';
 import '../../services/auth_service.dart';
 import '../../services/data_service.dart';
 import '../../services/ai_service.dart';
+import '../../services/firebase_monitoring_service.dart';
 import '../../core/config/firebase_config.dart';
 import '../../theme/app_theme.dart';
 import '../../components/bottom_nav.dart';
@@ -83,7 +84,6 @@ class _DashboardPageState extends ConsumerState<DashboardPage> {
         
         final index = _zones.indexWhere((z) => z.id == zoneId);
         if (index != -1) {
-          final previousCount = _zones[index].peopleCount;
           setState(() {
             // Update monitoring status - explicitly set based on API response
             _zoneMonitoringStatus[zoneId] = isMonitoring;
@@ -216,37 +216,69 @@ class _DashboardPageState extends ConsumerState<DashboardPage> {
       }
     }
 
-    // Subscribe to each zone (Firebase for zone config, API for people count)
+    // Subscribe to each zone (Firebase for zone config and local mode people count, API for HTTP mode people count)
     for (var zone in zones) {
-      // Firebase subscription for zone config updates
-      // NOTE: Don't update peopleCount or lastUpdated from Firebase - use API instead
+      // Check if zone is local mode
+      final isLocalMode = zone.cameraUrl == 'local';
+      
+      // Firebase subscription for zone config updates and people count (for local mode)
       final subscription = DataService.subscribeToZone(zone.id).listen((updatedZone) {
         if (updatedZone != null && mounted) {
           setState(() {
             final index = _zones.indexWhere((z) => z.id == updatedZone.id);
             if (index != -1) {
-              // Update zone config (name, thresholds, etc.) but keep people count and lastUpdated from API
-              // This prevents Firebase from overwriting API data
-              final currentPeopleCount = _zones[index].peopleCount;
-              final currentLastUpdated = _zones[index].lastUpdated;
+              // For local mode, use Firebase data for people count
+              // For HTTP mode, keep API data (will be updated by API polling)
+              final shouldUseFirebaseCount = isLocalMode;
               _zones[index] = ZoneData(
                 id: updatedZone.id,
                 name: updatedZone.name,
-                peopleCount: currentPeopleCount, // Keep from API
-                lastUpdated: currentLastUpdated, // Keep from API
+                peopleCount: shouldUseFirebaseCount ? updatedZone.peopleCount : _zones[index].peopleCount,
+                lastUpdated: shouldUseFirebaseCount ? updatedZone.lastUpdated : _zones[index].lastUpdated,
                 thresholds: updatedZone.thresholds,
                 cameraUrl: updatedZone.cameraUrl,
                 rtspUrl: updatedZone.rtspUrl,
                 averageServiceSpeed: updatedZone.averageServiceSpeed,
               );
+              
+              // Update monitoring status from Firebase (for local mode)
+              if (shouldUseFirebaseCount && updatedZone.lastUpdated > 0) {
+                _zoneMonitoringStatus[zone.id] = true;
+              }
             }
           });
         }
       });
       _zoneSubscriptions[zone.id] = subscription;
       
-      // API polling for people count (works even without Firebase)
-      _startApiPollingForZone(zone.id);
+      // Also subscribe to FirebaseMonitoringService for real-time updates (local mode)
+      if (isLocalMode) {
+        FirebaseMonitoringService.subscribeToZoneCount(zone.id).listen((data) {
+          if (data != null && mounted) {
+            setState(() {
+              final index = _zones.indexWhere((z) => z.id == zone.id);
+              if (index != -1) {
+                _zones[index] = ZoneData(
+                  id: _zones[index].id,
+                  name: _zones[index].name,
+                  peopleCount: data['peopleCount'] as int? ?? 0,
+                  lastUpdated: data['lastUpdated'] as int? ?? 0,
+                  thresholds: _zones[index].thresholds,
+                  cameraUrl: _zones[index].cameraUrl,
+                  rtspUrl: _zones[index].rtspUrl,
+                  averageServiceSpeed: _zones[index].averageServiceSpeed,
+                );
+                _zoneMonitoringStatus[zone.id] = data['isMonitoring'] as bool? ?? false;
+              }
+            });
+          }
+        });
+      }
+      
+      // API polling for people count (for HTTP mode only)
+      if (!isLocalMode) {
+        _startApiPollingForZone(zone.id);
+      }
     }
 
     // Subscribe to notifications count
@@ -758,10 +790,12 @@ class _DashboardPageState extends ConsumerState<DashboardPage> {
 
   @override
   Widget build(BuildContext context) {
-    // Use active camera from provider, or fallback to selected zone
+    // Use user-selected zone, or fallback to active camera from provider
+    // User selection takes priority over active camera provider
     final activeCameras = ref.watch(activeCameraProvider);
     final activeCameraId = activeCameras.isNotEmpty ? activeCameras.first : null;
-    final activeZoneId = activeCameraId ?? _selectedZoneId;
+    // Use _selectedZoneId first (user selection), then fallback to activeCameraId
+    final activeZoneId = _selectedZoneId ?? activeCameraId;
     
     final selectedZone = _zones.firstWhere(
       (zone) => zone.id == activeZoneId,
@@ -774,12 +808,15 @@ class _DashboardPageState extends ConsumerState<DashboardPage> {
       ),
     );
 
-    // Update selected zone ID if active camera changed
-    if (activeCameraId != null && activeCameraId != _selectedZoneId) {
+    // Update selected zone ID if active camera changed AND user hasn't manually selected a zone
+    // Only auto-update if _selectedZoneId is null (no manual selection)
+    if (activeCameraId != null && _selectedZoneId == null) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        setState(() {
-          _selectedZoneId = activeCameraId;
-        });
+        if (mounted) {
+          setState(() {
+            _selectedZoneId = activeCameraId;
+          });
+        }
       });
     }
 

@@ -3,7 +3,6 @@ import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
 import '../../services/auth_service.dart';
 import '../../services/data_service.dart';
-import '../../services/ai_service.dart';
 import '../../theme/app_theme.dart';
 
 class CameraSetupPage extends StatefulWidget {
@@ -19,18 +18,19 @@ class _CameraSetupPageState extends State<CameraSetupPage> {
   final _formKey = GlobalKey<FormState>();
   final _zoneNameController = TextEditingController();
   final _cameraUrlController = TextEditingController();
-  final _rtspUrlController = TextEditingController();
   final _lowThresholdController = TextEditingController(text: '20');
   final _mediumThresholdController = TextEditingController(text: '50');
   final _highThresholdController = TextEditingController(text: '80');
   final _criticalThresholdController = TextEditingController(text: '120');
   final _serviceSpeedController = TextEditingController(text: '2.0');
 
-  String _connectionType = 'http'; // 'http', 'rtsp', or 'direct'
+  String _connectionType = 'local'; // 'local' or 'http'
   bool _isLoading = false;
   bool _isLoadingZone = true;
   String? _errorMessage;
   String? _successMessage;
+  String? _zonePermission; // 'view', 'edit', or null (owner)
+  bool _isReadOnly = false;
 
   @override
   void initState() {
@@ -46,7 +46,6 @@ class _CameraSetupPageState extends State<CameraSetupPage> {
   void dispose() {
     _zoneNameController.dispose();
     _cameraUrlController.dispose();
-    _rtspUrlController.dispose();
     _lowThresholdController.dispose();
     _mediumThresholdController.dispose();
     _highThresholdController.dispose();
@@ -61,8 +60,15 @@ class _CameraSetupPageState extends State<CameraSetupPage> {
     });
 
     try {
-      final zone = await DataService.getZone(zoneId);
+      final user = AuthService.getCurrentUser();
+      final zone = await DataService.getZone(zoneId, userId: user?.uid);
       if (zone != null) {
+        // Check permission
+        if (user != null) {
+          _zonePermission = await DataService.getZonePermission(user.uid, zoneId);
+          _isReadOnly = _zonePermission == 'view'; // Read-only if view permission
+        }
+        
         setState(() {
           _zoneNameController.text = zone.name;
           _lowThresholdController.text = zone.thresholds.low.toString();
@@ -71,15 +77,12 @@ class _CameraSetupPageState extends State<CameraSetupPage> {
           _criticalThresholdController.text = zone.thresholds.critical.toString();
           _serviceSpeedController.text = (zone.averageServiceSpeed ?? 2.0).toString();
 
-          // Determine connection type
-          if (zone.cameraUrl != null && zone.cameraUrl != 'direct') {
+          // Load zone configuration
+          if (zone.cameraUrl == 'local') {
+            _connectionType = 'local';
+          } else if (zone.cameraUrl != null && zone.cameraUrl!.startsWith('http')) {
             _connectionType = 'http';
             _cameraUrlController.text = zone.cameraUrl!;
-          } else if (zone.rtspUrl != null) {
-            _connectionType = 'rtsp';
-            _rtspUrlController.text = zone.rtspUrl!;
-          } else if (zone.cameraUrl == 'direct') {
-            _connectionType = 'direct';
           }
 
           _isLoadingZone = false;
@@ -103,6 +106,14 @@ class _CameraSetupPageState extends State<CameraSetupPage> {
       return;
     }
 
+    // Check permission for editing
+    if (_isReadOnly) {
+      setState(() {
+        _errorMessage = 'You only have view permission. You cannot edit this camera setup.';
+      });
+      return;
+    }
+
     setState(() {
       _isLoading = true;
       _errorMessage = null;
@@ -118,6 +129,18 @@ class _CameraSetupPageState extends State<CameraSetupPage> {
         });
         return;
       }
+      
+      // Double-check permission before updating
+      if (widget.zoneId != null) {
+        final permission = await DataService.getZonePermission(user.uid, widget.zoneId!);
+        if (permission == 'view') {
+          setState(() {
+            _errorMessage = 'You only have view permission. You cannot edit this camera setup.';
+            _isLoading = false;
+          });
+          return;
+        }
+      }
 
       // Build zone data
       final zoneData = <String, dynamic>{
@@ -131,14 +154,13 @@ class _CameraSetupPageState extends State<CameraSetupPage> {
         'averageServiceSpeed': double.tryParse(_serviceSpeedController.text) ?? 2.0,
       };
 
-      // Add camera URL based on connection type
+      // Set camera URL based on connection type
       if (_connectionType == 'http' && _cameraUrlController.text.trim().isNotEmpty) {
+        // HTTP mode - use external camera server
         zoneData['cameraUrl'] = _cameraUrlController.text.trim();
-      } else if (_connectionType == 'rtsp' && _rtspUrlController.text.trim().isNotEmpty) {
-        zoneData['rtspUrl'] = _rtspUrlController.text.trim();
-      } else if (_connectionType == 'direct') {
-        // Direct camera access - no URL needed
-        zoneData['cameraUrl'] = 'direct';
+      } else {
+        // Local mode - use device camera
+        zoneData['cameraUrl'] = 'local';
       }
 
       // Update or create zone
@@ -151,21 +173,16 @@ class _CameraSetupPageState extends State<CameraSetupPage> {
         });
       } else {
         // Create new zone
-        final zoneId = await DataService.createZone(user.uid, zoneData);
+        await DataService.createZone(user.uid, zoneData);
         setState(() {
           _successMessage = 'Camera setup completed successfully!';
           _isLoading = false;
         });
 
-        // Request camera permission and start AI service if direct camera
-        // Note: This is optional - camera setup can complete even if AI service fails
-        if (_connectionType == 'direct') {
-          // Run in background - don't block the success message
-          _requestCameraPermissionAndStart(zoneId, zoneData).catchError((error) {
-            print('⚠️ Could not start AI service: $error');
-            // Don't show error to user here - camera setup was successful
-          });
-        }
+        // Request camera permission for local mode
+        _requestCameraPermission().catchError((error) {
+          print('⚠️ Could not request camera permission: $error');
+        });
       }
 
       // Navigate back after showing success message (both create and update)
@@ -184,153 +201,59 @@ class _CameraSetupPageState extends State<CameraSetupPage> {
     }
   }
 
-  Future<void> _requestCameraPermissionAndStart(String zoneId, Map<String, dynamic> zoneData) async {
-    // Request camera permission
+  Future<void> _requestCameraPermission() async {
+    // Request camera permission for local mode
     final status = await Permission.camera.request();
     
     if (!mounted) return;
 
     if (status.isDenied) {
-      // User denied permission, show dialog
-      final shouldRequest = await showDialog<bool>(
-        context: context,
-        builder: (context) => AlertDialog(
-          title: const Text('Camera Permission Required'),
-          content: const Text(
-            'CrowdSense needs camera access to monitor the zone. '
-            'Please allow camera access in your device settings to continue.',
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(false),
-              child: const Text('Cancel'),
-            ),
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(true),
-              child: const Text('Open Settings'),
-            ),
-          ],
-        ),
-      );
-
-      if (shouldRequest == true) {
-        await openAppSettings();
-      }
-      return;
-    }
-
-    if (status.isPermanentlyDenied) {
-      // Permission permanently denied, open settings
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Camera permission is permanently denied. Please enable it in settings.'),
-          backgroundColor: Colors.orange,
-          duration: Duration(seconds: 5),
-          action: SnackBarAction(
-            label: 'Open Settings',
-            onPressed: openAppSettings,
-          ),
-        ),
-      );
-      return;
-    }
-
-    if (status.isGranted) {
-      // Permission granted, start AI service
-      await _startAIService(zoneId, zoneData);
-    }
-  }
-
-  Future<void> _startAIService(String zoneId, Map<String, dynamic> zoneData) async {
-    // Load the zone and start AI service
-    try {
-      final zone = await DataService.getZone(zoneId);
-      if (zone != null && _connectionType == 'direct') {
-        // Show loading indicator
-        if (mounted) {
-          showDialog(
-            context: context,
-            barrierDismissible: false,
-            builder: (context) => const Center(
-              child: Card(
-                child: Padding(
-                  padding: EdgeInsets.all(24),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      CircularProgressIndicator(),
-                      SizedBox(height: 16),
-                      Text('Starting camera and AI service...'),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-          );
-        }
-
-        final started = await AIService.startZoneMonitoring(zoneId, zone);
-        
-        if (!mounted) return;
-        
-        // Dismiss loading dialog
-        if (mounted) {
-          Navigator.of(context).pop();
-        }
-
-        if (started) {
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(
-                content: Text('✅ Camera activated! AI service started successfully. Monitoring has begun.'),
-                backgroundColor: Colors.green,
-                duration: Duration(seconds: 3),
-              ),
-            );
-          }
-        } else {
-          // Show warning but don't block - camera setup was successful
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: const Text('⚠️ Warning: Could not start AI service. Make sure the Python service is running. Camera setup completed but monitoring not active. You can start monitoring later from the dashboard.'),
-                backgroundColor: Colors.orange,
-                duration: const Duration(seconds: 6),
-                action: SnackBarAction(
-                  label: 'OK',
-                  textColor: Colors.white,
-                  onPressed: () {},
-                ),
-              ),
-            );
-          }
-        }
-      }
-    } catch (e) {
-      print('⚠️ Failed to start AI service: $e');
       if (mounted) {
-        // Dismiss loading dialog if still showing
-        try {
-          Navigator.of(context).pop();
-        } catch (_) {
-          // Dialog might already be dismissed
-        }
-        // Show warning but don't block - camera setup was successful
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('⚠️ Warning: Could not start AI service: $e. Camera setup completed but monitoring not active. Make sure the Python AI service is running at http://localhost:8000'),
-            backgroundColor: Colors.orange,
-            duration: const Duration(seconds: 6),
-            action: SnackBarAction(
-              label: 'OK',
-              textColor: Colors.white,
-              onPressed: () {},
+        await showDialog(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: const Text('Camera Permission Required'),
+            content: const Text(
+              'CrowdSense needs camera access to use local camera mode. '
+              'Please allow camera access in your device settings.',
             ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(context).pop(),
+                child: const Text('OK'),
+              ),
+            ],
+          ),
+        );
+      }
+    } else if (status.isPermanentlyDenied) {
+      if (mounted) {
+        await showDialog(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: const Text('Camera Permission Required'),
+            content: const Text(
+              'Camera permission is permanently denied. Please enable it in settings.',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(context).pop(),
+                child: const Text('OK'),
+              ),
+              TextButton(
+                onPressed: () {
+                  openAppSettings();
+                  Navigator.of(context).pop();
+                },
+                child: const Text('Open Settings'),
+              ),
+            ],
           ),
         );
       }
     }
   }
+
 
   @override
   Widget build(BuildContext context) {
@@ -354,40 +277,33 @@ class _CameraSetupPageState extends State<CameraSetupPage> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              // Instructions
-              Card(
-                color: AppTheme.primary.withValues(alpha: 0.05),
-                child: Padding(
-                  padding: const EdgeInsets.all(16),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
+              // Permission warning for view-only users
+              if (_isReadOnly && widget.zoneId != null)
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  margin: const EdgeInsets.only(bottom: 16),
+                  decoration: BoxDecoration(
+                    color: Colors.orange.shade50,
+                    border: Border.all(color: Colors.orange.shade300),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Row(
                     children: [
-                      Row(
-                        children: [
-                          Icon(Icons.info_outline, color: AppTheme.primary),
-                          const SizedBox(width: 8),
-                          const Text(
-                            'Camera Setup',
-                            style: TextStyle(
-                              fontSize: 16,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 8),
-                      const Text(
-                        'Configure your camera connection to monitor a zone. You can use HTTP streaming, RTSP, or direct camera access.',
-                        style: TextStyle(fontSize: 14),
+                      Icon(Icons.info_outline, color: Colors.orange.shade700),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          'You have view-only permission. You cannot edit this camera setup.',
+                          style: TextStyle(color: Colors.orange.shade900),
+                        ),
                       ),
                     ],
                   ),
                 ),
-              ),
-              const SizedBox(height: 24),
               // Zone Name
               TextFormField(
                 controller: _zoneNameController,
+                readOnly: _isReadOnly,
                 decoration: const InputDecoration(
                   labelText: 'Zone Name *',
                   hintText: 'e.g., Main Entrance, Checkout Area',
@@ -401,9 +317,9 @@ class _CameraSetupPageState extends State<CameraSetupPage> {
                 },
               ),
               const SizedBox(height: 16),
-              // Connection Type
+              // Connection Type Selection
               Text(
-                'Connection Type *',
+                'Camera Connection Type *',
                 style: TextStyle(
                   fontSize: 14,
                   fontWeight: FontWeight.w500,
@@ -414,112 +330,51 @@ class _CameraSetupPageState extends State<CameraSetupPage> {
               SegmentedButton<String>(
                 segments: const [
                   ButtonSegment(
+                    value: 'local',
+                    label: Text('Local'),
+                    icon: Icon(Icons.camera_alt),
+                  ),
+                  ButtonSegment(
                     value: 'http',
                     label: Text('HTTP'),
                     icon: Icon(Icons.http),
                   ),
-                  ButtonSegment(
-                    value: 'rtsp',
-                    label: Text('RTSP'),
-                    icon: Icon(Icons.video_call),
-                  ),
-                  ButtonSegment(
-                    value: 'direct',
-                    label: Text('Direct'),
-                    icon: Icon(Icons.camera_alt),
-                  ),
                 ],
                 selected: {_connectionType},
-                onSelectionChanged: (Set<String> newSelection) {
+                onSelectionChanged: _isReadOnly ? null : (Set<String> newSelection) {
                   setState(() {
                     _connectionType = newSelection.first;
                   });
                 },
               ),
               const SizedBox(height: 16),
-              // Camera URL (for HTTP)
+              // HTTP Camera URL
               if (_connectionType == 'http')
                 Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     TextFormField(
                       controller: _cameraUrlController,
+                      readOnly: _isReadOnly,
                       decoration: const InputDecoration(
-                        labelText: 'Camera URL *',
+                        labelText: 'HTTP Camera URL *',
                         hintText: 'http://192.168.1.100:8080/video',
                         border: OutlineInputBorder(),
-                        helperText: 'Enter the HTTP streaming URL of your camera or external camera',
+                        helperText: 'Enter the HTTP streaming URL from external camera server (e.g., python main.py --enable-external-camera)',
                       ),
-                  validator: (value) {
-                    if (_connectionType == 'http' && (value == null || value.trim().isEmpty)) {
-                      return 'Please enter a camera URL';
-                    }
-                    if (value != null && value.trim().isNotEmpty) {
-                      if (!value.startsWith('http://') && !value.startsWith('https://')) {
-                        return 'URL must start with http:// or https://';
-                      }
-                    }
-                    return null;
-                  },
+                      validator: (value) {
+                        if (_connectionType == 'http' && (value == null || value.trim().isEmpty)) {
+                          return 'Please enter a camera URL';
+                        }
+                        if (value != null && value.trim().isNotEmpty) {
+                          if (!value.startsWith('http://') && !value.startsWith('https://')) {
+                            return 'URL must start with http:// or https://';
+                          }
+                        }
+                        return null;
+                      },
                     ),
                   ],
-                ),
-              // RTSP URL (for RTSP)
-              if (_connectionType == 'rtsp')
-                Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    TextFormField(
-                      controller: _rtspUrlController,
-                      decoration: const InputDecoration(
-                        labelText: 'RTSP URL *',
-                        hintText: 'rtsp://192.168.1.100:554/stream',
-                        border: OutlineInputBorder(),
-                        helperText: 'Enter the RTSP streaming URL of your camera or external camera',
-                      ),
-                  validator: (value) {
-                    if (_connectionType == 'rtsp' && (value == null || value.trim().isEmpty)) {
-                      return 'Please enter an RTSP URL';
-                    }
-                    if (value != null && value.trim().isNotEmpty) {
-                      if (!value.startsWith('rtsp://')) {
-                        return 'URL must start with rtsp://';
-                      }
-                    }
-                    return null;
-                  },
-                    ),
-                  ],
-                ),
-              // Direct camera info
-              if (_connectionType == 'direct')
-                Card(
-                  color: AppTheme.muted.withValues(alpha: 0.3),
-                  child: Padding(
-                    padding: const EdgeInsets.all(16),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Row(
-                          children: [
-                            Icon(Icons.info, size: 20, color: AppTheme.primary),
-                            const SizedBox(width: 8),
-                            const Text(
-                              'Direct Camera Access',
-                              style: TextStyle(
-                                fontWeight: FontWeight.bold,
-                              ),
-                            ),
-                          ],
-                        ),
-                        const SizedBox(height: 8),
-                        const Text(
-                          'The app will use the device\'s default camera. Make sure camera permissions are granted.',
-                          style: TextStyle(fontSize: 14),
-                        ),
-                      ],
-                    ),
-                  ),
                 ),
               const SizedBox(height: 24),
               // Thresholds Section
@@ -542,6 +397,7 @@ class _CameraSetupPageState extends State<CameraSetupPage> {
                   Expanded(
                     child: TextFormField(
                       controller: _lowThresholdController,
+                      readOnly: _isReadOnly,
                       decoration: const InputDecoration(
                         labelText: 'Low',
                         border: OutlineInputBorder(),
@@ -560,6 +416,7 @@ class _CameraSetupPageState extends State<CameraSetupPage> {
                   Expanded(
                     child: TextFormField(
                       controller: _mediumThresholdController,
+                      readOnly: _isReadOnly,
                       decoration: const InputDecoration(
                         labelText: 'Medium',
                         border: OutlineInputBorder(),
@@ -582,6 +439,7 @@ class _CameraSetupPageState extends State<CameraSetupPage> {
                   Expanded(
                     child: TextFormField(
                       controller: _highThresholdController,
+                      readOnly: _isReadOnly,
                       decoration: const InputDecoration(
                         labelText: 'High',
                         border: OutlineInputBorder(),
@@ -600,6 +458,7 @@ class _CameraSetupPageState extends State<CameraSetupPage> {
                   Expanded(
                     child: TextFormField(
                       controller: _criticalThresholdController,
+                      readOnly: _isReadOnly,
                       decoration: const InputDecoration(
                         labelText: 'Critical',
                         border: OutlineInputBorder(),
@@ -620,6 +479,7 @@ class _CameraSetupPageState extends State<CameraSetupPage> {
               // Service Speed
               TextFormField(
                 controller: _serviceSpeedController,
+                readOnly: _isReadOnly,
                 decoration: const InputDecoration(
                   labelText: 'Average Service Speed (minutes/person)',
                   hintText: '2.0',
@@ -690,7 +550,7 @@ class _CameraSetupPageState extends State<CameraSetupPage> {
               SizedBox(
                 width: double.infinity,
                 child: ElevatedButton(
-                  onPressed: _isLoading ? null : _handleSubmit,
+                  onPressed: (_isLoading || _isReadOnly) ? null : _handleSubmit,
                   style: ElevatedButton.styleFrom(
                     padding: const EdgeInsets.symmetric(vertical: 16),
                   ),

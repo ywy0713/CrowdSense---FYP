@@ -267,13 +267,38 @@ class _PlaybackPageState extends State<PlaybackPage> {
                 ],
               ),
             ),
-          IconButton(
-            icon: const Icon(Icons.refresh),
-            onPressed: () {
-              _loadVideos();
-              _checkStorageStatus();
+          PopupMenuButton<String>(
+            icon: const Icon(Icons.more_vert),
+            onSelected: (value) async {
+              if (value == 'refresh') {
+                _loadVideos();
+                _checkStorageStatus();
+              } else if (value == 'cleanup') {
+                await _cleanupMetadata();
+              }
             },
-            tooltip: 'Refresh & Sync',
+            itemBuilder: (context) => [
+              const PopupMenuItem(
+                value: 'refresh',
+                child: Row(
+                  children: [
+                    Icon(Icons.refresh, size: 20),
+                    SizedBox(width: 8),
+                    Text('Refresh & Sync'),
+                  ],
+                ),
+              ),
+              const PopupMenuItem(
+                value: 'cleanup',
+                child: Row(
+                  children: [
+                    Icon(Icons.cleaning_services, size: 20),
+                    SizedBox(width: 8),
+                    Text('Clean Up Invalid Videos'),
+                  ],
+                ),
+              ),
+            ],
           ),
         ],
       ),
@@ -712,6 +737,63 @@ class _PlaybackPageState extends State<PlaybackPage> {
       barrierDismissible: true,
       builder: (context) => VideoPlayerDialog(video: video),
     );
+  }
+
+  Future<void> _cleanupMetadata() async {
+    if (_selectedZoneId == null) return;
+
+    // Show loading dialog
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => const Center(
+        child: CircularProgressIndicator(),
+      ),
+    );
+
+    try {
+      final result = await VideoService.cleanupVideoMetadata(_selectedZoneId!);
+      
+      if (mounted) {
+        Navigator.of(context).pop(); // Close loading dialog
+        
+        if (result != null) {
+          final removedCount = result['removed_count'] ?? 0;
+          final remainingCount = result['remaining_count'] ?? 0;
+          
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                removedCount > 0
+                    ? 'Cleaned up $removedCount invalid video${removedCount != 1 ? 's' : ''}. $remainingCount video${remainingCount != 1 ? 's' : ''} remaining.'
+                    : 'No invalid videos found. All videos are valid.',
+              ),
+              duration: const Duration(seconds: 3),
+            ),
+          );
+          
+          // Reload videos to reflect cleanup
+          _loadVideos();
+        } else {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Failed to cleanup metadata'),
+              backgroundColor: Colors.red,
+            ),
+          );
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        Navigator.of(context).pop(); // Close loading dialog
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error cleaning up metadata: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
   }
 
 }

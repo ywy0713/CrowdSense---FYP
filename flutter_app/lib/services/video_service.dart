@@ -390,5 +390,22 @@ class VideoService {
     final storageInfo = await getLocalStorageInfo(zoneId);
     return storageInfo.isFull;
   }
+
+  /// Clean up metadata by removing entries for videos that don't exist
+  static Future<Map<String, dynamic>?> cleanupVideoMetadata(String zoneId) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$baseUrl/zones/$zoneId/videos/cleanup'),
+      ).timeout(const Duration(seconds: 10));
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        return data;
+      }
+    } catch (e) {
+      print('Error cleaning up video metadata: $e');
+    }
+    return null;
+  }
 }
 
