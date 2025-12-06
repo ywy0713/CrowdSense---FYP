@@ -177,40 +177,17 @@ class _NotificationsPageState extends ConsumerState<NotificationsPage> {
                       ],
                     ),
                   ),
-                // Zone selector
-                if (_zones.isNotEmpty && !_isLoading)
-                  Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 16,
-                      vertical: 8,
-                    ),
-                    child: DropdownButtonFormField<String>(
-                      value: _selectedZoneId,
-                      decoration: const InputDecoration(
-                        labelText: 'Select Zone',
-                        border: OutlineInputBorder(),
-                        isDense: true,
-                        contentPadding: EdgeInsets.symmetric(
-                          horizontal: 12,
-                          vertical: 12,
-                        ),
+                // Zone selector removed as per request - using active camera/zone
+                if (_selectedZoneId != null && _zones.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+                    child: Text(
+                      'Showing notifications for: ${_zones.firstWhere((z) => z.id == _selectedZoneId, orElse: () => _zones.first).name}',
+                      style: TextStyle(
+                        color: AppTheme.mutedForeground,
+                        fontSize: 13,
+                        fontStyle: FontStyle.italic,
                       ),
-                      items: _zones.map((zone) {
-                        return DropdownMenuItem(
-                          value: zone.id,
-                          child: Text(zone.name),
-                        );
-                      }).toList(),
-                      onChanged: (value) async {
-                        setState(() {
-                          _selectedZoneId = value;
-                        });
-                        if (value != null) {
-                          // Load read status first, then subscribe to alerts
-                          await _loadReadStatusFromFirebase(value);
-                          _subscribeToAlerts();
-                        }
-                      },
                     ),
                   ),
                 // Alerts list

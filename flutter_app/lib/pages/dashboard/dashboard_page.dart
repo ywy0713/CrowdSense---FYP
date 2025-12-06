@@ -68,6 +68,17 @@ class _DashboardPageState extends ConsumerState<DashboardPage> {
 
   // Immediately refresh a single zone from API
   Future<void> _refreshZoneImmediately(String zoneId) async {
+    // Check if this is a local zone first
+    final index = _zones.indexWhere((z) => z.id == zoneId);
+    if (index != -1) {
+      final zone = _zones[index];
+      if (zone.cameraUrl == 'local') {
+        // Local mode: Don't poll API, trust existing status or Firebase
+        print('ℹ️ Skipping API refresh for local zone $zoneId');
+        return;
+      }
+    }
+
     try {
       final baseUrl = AIService.baseUrl;
       final url = '$baseUrl/zones/$zoneId/count';
@@ -277,7 +288,11 @@ class _DashboardPageState extends ConsumerState<DashboardPage> {
       
       // API polling for people count (for HTTP mode only)
       if (!isLocalMode) {
-        _startApiPollingForZone(zone.id);
+      _startApiPollingForZone(zone.id);
+      } else {
+        // For local mode, we don't poll API because Python service isn't running logic for this zone.
+        // Instead, we consider it "monitoring" if we receive recent updates from Firebase.
+        // The _zoneMonitoringStatus is updated by the Firebase subscription above.
       }
     }
 
@@ -813,9 +828,9 @@ class _DashboardPageState extends ConsumerState<DashboardPage> {
     if (activeCameraId != null && _selectedZoneId == null) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) {
-          setState(() {
-            _selectedZoneId = activeCameraId;
-          });
+        setState(() {
+          _selectedZoneId = activeCameraId;
+        });
         }
       });
     }
@@ -908,8 +923,45 @@ class _DashboardPageState extends ConsumerState<DashboardPage> {
                             // WAITING ZONE Card (matches image design)
                             _buildWaitingZoneCard(selectedZone),
                             const SizedBox(height: 16),
+                            
+                            // Local Mode Warning (Replaces Waiting Time Section)
+                            if (selectedZone.cameraUrl == 'local')
+                              Container(
+                                width: double.infinity,
+                                padding: const EdgeInsets.all(20),
+                                decoration: BoxDecoration(
+                                  color: Colors.orange.shade50,
+                                  borderRadius: BorderRadius.circular(12),
+                                  border: Border.all(color: Colors.orange.shade200),
+                                ),
+                                child: Column(
+                                  children: [
+                                    Icon(Icons.info_outline, color: Colors.orange.shade800, size: 32),
+                                    const SizedBox(height: 12),
+                                    Text(
+                                      'Analytics Unavailable',
+                                      style: TextStyle(
+                                        fontSize: 16,
+                                        fontWeight: FontWeight.bold,
+                                        color: Colors.orange.shade900,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 4),
+                                    Text(
+                                      'Advanced analytics (Waiting Time, Load %) are not available in Local Mode. Please view the live stream for real-time monitoring.',
+                                      textAlign: TextAlign.center,
+                                      style: TextStyle(
+                                        fontSize: 12,
+                                        color: Colors.orange.shade800,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              )
+                            else
                             // Estimated Waiting Time Section
                             _buildWaitingTimeSection(selectedZone),
+                              
                             const SizedBox(height: 16),
                             // Tips and Status Cards
                             Row(
@@ -1122,10 +1174,21 @@ class _DashboardPageState extends ConsumerState<DashboardPage> {
   }
 
   Widget _buildStatusCard(ZoneData zone) {
-    // Check monitoring status from map
-    // IMPORTANT: Don't infer from lastUpdated - only use explicit API response
-    // Default to false (offline) if status is not yet known
-    final isMonitoring = _zoneMonitoringStatus[zone.id] ?? false;
+    // Check monitoring status
+    // For Local mode: monitoring is active if last update was recent
+    // For HTTP mode: monitoring depends on API status map
+    final isLocalMode = zone.cameraUrl == 'local';
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final timeSinceUpdate = now - zone.lastUpdated;
+    
+    bool isMonitoring = false;
+    if (isLocalMode) {
+      // Local mode is considered monitoring if updated within last 20 seconds
+      isMonitoring = zone.lastUpdated > 0 && timeSinceUpdate < 20000;
+    } else {
+      // HTTP mode uses API status
+      isMonitoring = _zoneMonitoringStatus[zone.id] ?? false;
+    }
     
     // If not monitoring, always show offline
     if (!isMonitoring) {
@@ -1159,10 +1222,7 @@ class _DashboardPageState extends ConsumerState<DashboardPage> {
     }
     
     // If monitoring, check if updated within last 20 seconds
-    // Only check if we know it's monitoring (don't infer)
-    final now = DateTime.now().millisecondsSinceEpoch;
-    final timeSinceUpdate = now - zone.lastUpdated;
-    final isActive = isMonitoring && zone.lastUpdated > 0 && timeSinceUpdate < 20000; // Active if monitoring and updated within last 20 seconds
+    final isActive = isMonitoring && zone.lastUpdated > 0 && timeSinceUpdate < 20000;
 
     return Card(
       margin: EdgeInsets.zero,
@@ -1181,7 +1241,9 @@ class _DashboardPageState extends ConsumerState<DashboardPage> {
             ),
             const SizedBox(height: 8),
             Text(
-              isActive ? 'System online. Streaming updates.' : 'System offline.',
+              isActive 
+                  ? (isLocalMode ? 'System online (Local Processing).' : 'System online. Streaming updates.') 
+                  : 'System offline.',
               style: TextStyle(
                 fontSize: 12,
                 color: AppTheme.mutedForeground,
@@ -1194,10 +1256,17 @@ class _DashboardPageState extends ConsumerState<DashboardPage> {
   }
 
   String _getLastUpdatedDisplay(ZoneData zone) {
-    // Check monitoring status from map only
-    // IMPORTANT: Don't infer from lastUpdated - only use explicit API response
-    // Default to false (Never) if status is not yet known
-    final isMonitoring = _zoneMonitoringStatus[zone.id] ?? false;
+    // Same logic for Last Updated display
+    final isLocalMode = zone.cameraUrl == 'local';
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final timeSinceUpdate = now - zone.lastUpdated;
+    
+    bool isMonitoring = false;
+    if (isLocalMode) {
+      isMonitoring = zone.lastUpdated > 0 && timeSinceUpdate < 20000;
+    } else {
+      isMonitoring = _zoneMonitoringStatus[zone.id] ?? false;
+    }
     
     if (!isMonitoring) {
       return 'Never';

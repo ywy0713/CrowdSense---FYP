@@ -18,6 +18,7 @@ class _CameraSetupPageState extends State<CameraSetupPage> {
   final _formKey = GlobalKey<FormState>();
   final _zoneNameController = TextEditingController();
   final _cameraUrlController = TextEditingController();
+  final _rtspUrlController = TextEditingController();
   final _lowThresholdController = TextEditingController(text: '20');
   final _mediumThresholdController = TextEditingController(text: '50');
   final _highThresholdController = TextEditingController(text: '80');
@@ -46,6 +47,7 @@ class _CameraSetupPageState extends State<CameraSetupPage> {
   void dispose() {
     _zoneNameController.dispose();
     _cameraUrlController.dispose();
+    _rtspUrlController.dispose();
     _lowThresholdController.dispose();
     _mediumThresholdController.dispose();
     _highThresholdController.dispose();
@@ -78,7 +80,13 @@ class _CameraSetupPageState extends State<CameraSetupPage> {
           _serviceSpeedController.text = (zone.averageServiceSpeed ?? 2.0).toString();
 
           // Load zone configuration
-          if (zone.cameraUrl == 'local') {
+          if (zone.rtspUrl != null && zone.rtspUrl!.isNotEmpty) {
+            _connectionType = 'rtsp';
+            _rtspUrlController.text = zone.rtspUrl!;
+            if (zone.cameraUrl != null) {
+              _cameraUrlController.text = zone.cameraUrl!;
+            }
+          } else if (zone.cameraUrl == 'local') {
             _connectionType = 'local';
           } else if (zone.cameraUrl != null && zone.cameraUrl!.startsWith('http')) {
             _connectionType = 'http';
@@ -155,12 +163,20 @@ class _CameraSetupPageState extends State<CameraSetupPage> {
       };
 
       // Set camera URL based on connection type
-      if (_connectionType == 'http' && _cameraUrlController.text.trim().isNotEmpty) {
+      if (_connectionType == 'http') {
         // HTTP mode - use external camera server
         zoneData['cameraUrl'] = _cameraUrlController.text.trim();
+        zoneData['rtspUrl'] = null;
+      } else if (_connectionType == 'rtsp') {
+        // RTSP mode
+        zoneData['rtspUrl'] = _rtspUrlController.text.trim();
+        // For RTSP mode, we use the RTSP URL as the camera URL as well since we removed the separate View URL field
+        // The VideoSurveillancePage will handle RTSP playback using VideoPlayer
+        zoneData['cameraUrl'] = _rtspUrlController.text.trim();
       } else {
         // Local mode - use device camera
         zoneData['cameraUrl'] = 'local';
+        zoneData['rtspUrl'] = null;
       }
 
       // Update or create zone
@@ -182,7 +198,7 @@ class _CameraSetupPageState extends State<CameraSetupPage> {
         // Request camera permission for local mode
         _requestCameraPermission().catchError((error) {
           print('⚠️ Could not request camera permission: $error');
-        });
+          });
       }
 
       // Navigate back after showing success message (both create and update)
@@ -210,31 +226,31 @@ class _CameraSetupPageState extends State<CameraSetupPage> {
     if (status.isDenied) {
       if (mounted) {
         await showDialog(
-          context: context,
-          builder: (context) => AlertDialog(
-            title: const Text('Camera Permission Required'),
-            content: const Text(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Camera Permission Required'),
+          content: const Text(
               'CrowdSense needs camera access to use local camera mode. '
               'Please allow camera access in your device settings.',
-            ),
-            actions: [
-              TextButton(
+          ),
+          actions: [
+            TextButton(
                 onPressed: () => Navigator.of(context).pop(),
                 child: const Text('OK'),
-              ),
-            ],
-          ),
-        );
+            ),
+          ],
+        ),
+      );
       }
     } else if (status.isPermanentlyDenied) {
-      if (mounted) {
+        if (mounted) {
         await showDialog(
-          context: context,
+            context: context,
           builder: (context) => AlertDialog(
             title: const Text('Camera Permission Required'),
             content: const Text(
               'Camera permission is permanently denied. Please enable it in settings.',
-            ),
+                  ),
             actions: [
               TextButton(
                 onPressed: () => Navigator.of(context).pop(),
@@ -243,7 +259,7 @@ class _CameraSetupPageState extends State<CameraSetupPage> {
               TextButton(
                 onPressed: () {
                   openAppSettings();
-                  Navigator.of(context).pop();
+          Navigator.of(context).pop();
                 },
                 child: const Text('Open Settings'),
               ),
@@ -290,24 +306,25 @@ class _CameraSetupPageState extends State<CameraSetupPage> {
                   child: Row(
                     children: [
                       Icon(Icons.info_outline, color: Colors.orange.shade700),
-                      const SizedBox(width: 8),
+                          const SizedBox(width: 8),
                       Expanded(
                         child: Text(
                           'You have view-only permission. You cannot edit this camera setup.',
                           style: TextStyle(color: Colors.orange.shade900),
-                        ),
+                            ),
+                          ),
+                        ],
                       ),
-                    ],
-                  ),
                 ),
               // Zone Name
               TextFormField(
                 controller: _zoneNameController,
                 readOnly: _isReadOnly,
-                decoration: const InputDecoration(
+                decoration: InputDecoration(
                   labelText: 'Zone Name *',
                   hintText: 'e.g., Main Entrance, Checkout Area',
-                  border: OutlineInputBorder(),
+                  hintStyle: TextStyle(color: Colors.grey.shade400),
+                  border: const OutlineInputBorder(),
                 ),
                 validator: (value) {
                   if (value == null || value.trim().isEmpty) {
@@ -339,6 +356,11 @@ class _CameraSetupPageState extends State<CameraSetupPage> {
                     label: Text('HTTP'),
                     icon: Icon(Icons.http),
                   ),
+                  ButtonSegment(
+                    value: 'rtsp',
+                    label: Text('RTSP'),
+                    icon: Icon(Icons.videocam),
+                  ),
                 ],
                 selected: {_connectionType},
                 onSelectionChanged: _isReadOnly ? null : (Set<String> newSelection) {
@@ -348,7 +370,39 @@ class _CameraSetupPageState extends State<CameraSetupPage> {
                 },
               ),
               const SizedBox(height: 16),
-              // HTTP Camera URL
+              // RTSP Camera URL (Source)
+              if (_connectionType == 'rtsp')
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    TextFormField(
+                      controller: _rtspUrlController,
+                      readOnly: _isReadOnly,
+                      decoration: InputDecoration(
+                        labelText: 'RTSP Camera Source URL *',
+                        hintText: 'rtsp://admin:123456@192.168.1.50:554/stream',
+                        hintStyle: TextStyle(color: Colors.grey.shade400),
+                        border: const OutlineInputBorder(),
+                        helperText: 'The source URL of the IP Camera',
+                        helperMaxLines: 3,
+                      ),
+                      validator: (value) {
+                        if (_connectionType == 'rtsp' && (value == null || value.trim().isEmpty)) {
+                          return 'Please enter RTSP URL';
+                        }
+                        if (value != null && value.trim().isNotEmpty) {
+                          if (!value.startsWith('rtsp://')) {
+                            return 'URL must start with rtsp://';
+                          }
+                        }
+                        return null;
+                      },
+                    ),
+                    const SizedBox(height: 16),
+                  ],
+                ),
+
+              // HTTP Camera URL (View)
               if (_connectionType == 'http')
                 Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -356,15 +410,18 @@ class _CameraSetupPageState extends State<CameraSetupPage> {
                     TextFormField(
                       controller: _cameraUrlController,
                       readOnly: _isReadOnly,
-                      decoration: const InputDecoration(
+                      decoration: InputDecoration(
                         labelText: 'HTTP Camera URL *',
-                        hintText: 'http://192.168.1.100:8080/video',
-                        border: OutlineInputBorder(),
-                        helperText: 'Enter the HTTP streaming URL from external camera server (e.g., python main.py --enable-external-camera)',
+                        hintText: 'http://192.168.1.100:8000/video',
+                        hintStyle: TextStyle(color: Colors.grey.shade400),
+                        border: const OutlineInputBorder(),
+                        helperText: 'Enter the HTTP streaming URL from external camera server',
+                        helperMaxLines: 3,
                       ),
                       validator: (value) {
-                        if (_connectionType == 'http' && (value == null || value.trim().isEmpty)) {
-                          return 'Please enter a camera URL';
+                        if (_connectionType == 'http' && 
+                            (value == null || value.trim().isEmpty)) {
+                          return 'Please enter the HTTP View URL';
                         }
                         if (value != null && value.trim().isNotEmpty) {
                           if (!value.startsWith('http://') && !value.startsWith('https://')) {
@@ -480,11 +537,13 @@ class _CameraSetupPageState extends State<CameraSetupPage> {
               TextFormField(
                 controller: _serviceSpeedController,
                 readOnly: _isReadOnly,
-                decoration: const InputDecoration(
+                decoration: InputDecoration(
                   labelText: 'Average Service Speed (minutes/person)',
                   hintText: '2.0',
-                  border: OutlineInputBorder(),
+                  hintStyle: TextStyle(color: Colors.grey.shade400),
+                  border: const OutlineInputBorder(),
                   helperText: 'Average number of people served per minute',
+                  helperMaxLines: 2,
                 ),
                 keyboardType: const TextInputType.numberWithOptions(decimal: true),
                 inputFormatters: [

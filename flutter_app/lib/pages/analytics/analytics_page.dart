@@ -243,10 +243,8 @@ class _AnalyticsPageState extends ConsumerState<AnalyticsPage> {
                                       ),
                                       const SizedBox(height: 24),
                                       Expanded(
-                                        child: InteractiveViewer(
-                                          constrained: false,
-                                          minScale: 0.5,
-                                          maxScale: 3.0,
+                                        child: SingleChildScrollView(
+                                          scrollDirection: Axis.horizontal,
                                           child: SizedBox(
                                             width: _calculateChartWidth(),
                                             height: 400,
@@ -300,93 +298,105 @@ class _AnalyticsPageState extends ConsumerState<AnalyticsPage> {
   }
 
   double _calculateChartWidth() {
-    // Calculate width based on data points: minimum 300, add 50 per data point
-    // This ensures labels don't overlap
-    final baseWidth = 300.0;
-    final widthPerPoint = 50.0;
-    return baseWidth + (_analyticsData.length * widthPerPoint);
+    // Ensure minimum width is the screen width minus padding
+    final minWidth = MediaQuery.of(context).size.width - 64;
+    
+    // Calculate required width based on data points to allow comfortable scrolling
+    // Use 30 pixels per point to ensure density but readability
+    final contentWidth = _analyticsData.length * 30.0;
+    
+    // Return the larger of the two
+    return contentWidth < minWidth ? minWidth : contentWidth;
   }
 
   LineChartData _buildChartData() {
-    final maxCount = _analyticsData.isEmpty
-        ? 10
-        : _analyticsData.map((e) => e.count).reduce((a, b) => a > b ? a : b);
+    if (_analyticsData.isEmpty) {
+       return LineChartData(); // Return empty chart if no data
+    }
+
+    // Use all data points (no downsampling) to allow full scrolling
+    final chartData = _analyticsData;
     
-    // Calculate interval for X-axis labels to avoid overlap
-    final xInterval = (_analyticsData.length / 20).ceil().clamp(1, _analyticsData.length);
+    final maxCount = chartData.map((e) => e.count).reduce((a, b) => a > b ? a : b);
+    // Ensure maxCount is at least 5 to avoid flat lines at bottom
+    final yMax = (maxCount > 5 ? maxCount : 5).toDouble() * 1.2; 
+    
+    // Calculate interval for X-axis labels (show roughly every 2-3 points for clarity)
+    // Since we have wide scrolling, we can show frequent labels
+    final xInterval = 3.0;
     
     return LineChartData(
       gridData: FlGridData(
         show: true,
-        drawVerticalLine: true,
+        drawVerticalLine: false, // Reduce clutter
         horizontalInterval: 1,
-        verticalInterval: xInterval.toDouble(),
+        getDrawingHorizontalLine: (value) => FlLine(
+          color: AppTheme.border,
+          strokeWidth: 1,
+          dashArray: [5, 5], // Dashed lines
+        ),
       ),
       titlesData: FlTitlesData(
         leftTitles: AxisTitles(
           sideTitles: SideTitles(
             showTitles: true,
-            reservedSize: 40,
-            interval: (maxCount / 5).ceil().toDouble().clamp(1, maxCount.toDouble()),
+            reservedSize: 35,
+            interval: (yMax / 5).ceil().toDouble(), // Smart interval
             getTitlesWidget: (value, meta) {
-              if (value.toInt() == value && value >= 0 && value <= maxCount) {
-                return Padding(
-                  padding: const EdgeInsets.only(right: 8),
-                  child: Text(
-                    value.toInt().toString(),
-                    style: const TextStyle(fontSize: 10),
-                    textAlign: TextAlign.right,
-                  ),
-                );
+               if (value % 1 == 0) {
+                 return Text(value.toInt().toString(), style: const TextStyle(fontSize: 10));
               }
-              return const Text('');
+               return const SizedBox.shrink();
             },
           ),
         ),
         bottomTitles: AxisTitles(
           sideTitles: SideTitles(
             showTitles: true,
-            reservedSize: 30,
-            interval: xInterval.toDouble(),
+            reservedSize: 40, // Increased height for 2-line date/time
+            interval: xInterval,
             getTitlesWidget: (value, meta) {
               final index = value.toInt();
-              if (index >= 0 && index < _analyticsData.length && index % xInterval == 0) {
+              if (index >= 0 && index < chartData.length) {
                 final date = DateTime.fromMillisecondsSinceEpoch(
-                  _analyticsData[index].timestamp,
+                  chartData[index].timestamp,
                 );
                 return Padding(
                   padding: const EdgeInsets.only(top: 8),
                   child: Text(
-                    '${date.day}/${date.month} ${date.hour}:${date.minute.toString().padLeft(2, '0')}',
+                    '${date.month}/${date.day}\n${date.hour}:${date.minute.toString().padLeft(2, '0')}',
                     style: const TextStyle(fontSize: 9),
                     textAlign: TextAlign.center,
                   ),
                 );
               }
-              return const Text('');
+              return const SizedBox.shrink();
             },
           ),
         ),
         rightTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
         topTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
       ),
-      borderData: FlBorderData(show: true),
+      borderData: FlBorderData(show: false),
       lineBarsData: [
         LineChartBarData(
-          spots: _analyticsData.asMap().entries.map((entry) {
+          spots: chartData.asMap().entries.map((entry) {
             return FlSpot(entry.key.toDouble(), entry.value.count.toDouble());
           }).toList(),
-          isCurved: true,
+          isCurved: true, // Smooth lines
           color: AppTheme.primary,
           barWidth: 3,
           dotData: FlDotData(show: false),
-          belowBarData: BarAreaData(show: false),
+          belowBarData: BarAreaData(
+             show: true, 
+             color: AppTheme.primary.withValues(alpha: 0.1)
+          ),
         ),
       ],
       minX: 0,
-      maxX: _analyticsData.length > 0 ? (_analyticsData.length - 1).toDouble() : 1,
+      maxX: (chartData.length - 1).toDouble(),
       minY: 0,
-      maxY: maxCount.toDouble() * 1.2,
+      maxY: yMax,
     );
   }
 

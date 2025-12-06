@@ -258,12 +258,12 @@ class DataService {
   static Future<List<ZoneData>> getUserZones(String userId) async {
     try {
       final zones = <ZoneData>[];
-      
+
       // Get zones owned by user
       final ownedZonesSnapshot = await _database.child('users/$userId/zones').get();
       if (ownedZonesSnapshot.exists) {
         final zoneIds = Map<String, dynamic>.from(ownedZonesSnapshot.value as Map).keys.toList();
-        for (final zoneId in zoneIds) {
+      for (final zoneId in zoneIds) {
           final zoneSnapshot = await _database.child('zones/$zoneId').get();
           if (zoneSnapshot.exists) {
             final zoneData = Map<dynamic, dynamic>.from(zoneSnapshot.value as Map);

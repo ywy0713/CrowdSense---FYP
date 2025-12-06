@@ -67,9 +67,9 @@ class _DeviceSharingPageState extends State<DeviceSharingPage> {
     try {
       final code = await SharingService.getSharingCode(_selectedZoneId!);
       if (mounted) {
-        setState(() {
+      setState(() {
           _sharingCode = code;
-        });
+      });
       }
     } catch (e) {
       print('Error loading sharing code: $e');
@@ -109,8 +109,8 @@ class _DeviceSharingPageState extends State<DeviceSharingPage> {
       );
 
       if (code != null && mounted) {
-        setState(() {
-          _sharingCode = code;
+    setState(() {
+      _sharingCode = code;
           _isLoading = false;
         });
         ScaffoldMessenger.of(context).showSnackBar(
@@ -231,49 +231,49 @@ class _DeviceSharingPageState extends State<DeviceSharingPage> {
       ),
       body: _isLoading
           ? const Center(child: CircularProgressIndicator())
-          : SingleChildScrollView(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
+              : SingleChildScrollView(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
                   // Zone selector (only show if user has zones)
                   if (_zones.isNotEmpty) ...[
-                    DropdownButtonFormField<String>(
-                      value: _selectedZoneId,
-                      decoration: const InputDecoration(
-                        labelText: 'Select Zone',
-                        border: OutlineInputBorder(),
-                      ),
-                      items: _zones.map((zone) {
-                        return DropdownMenuItem(
-                          value: zone.id,
-                          child: Text(zone.name),
-                        );
-                      }).toList(),
-                      onChanged: (value) {
-                        setState(() {
-                          _selectedZoneId = value;
-                          _sharingCode = null;
-                        });
+                      DropdownButtonFormField<String>(
+                        value: _selectedZoneId,
+                        decoration: const InputDecoration(
+                          labelText: 'Select Zone',
+                          border: OutlineInputBorder(),
+                        ),
+                        items: _zones.map((zone) {
+                          return DropdownMenuItem(
+                            value: zone.id,
+                            child: Text(zone.name),
+                          );
+                        }).toList(),
+                        onChanged: (value) {
+                          setState(() {
+                            _selectedZoneId = value;
+                            _sharingCode = null;
+                          });
                         _loadSharingCode();
                         _subscribeToSharedUsers();
-                      },
-                    ),
-                    const SizedBox(height: 24),
+                        },
+                      ),
+                      const SizedBox(height: 24),
                     // Generate sharing code section (only show if user has zones)
-                    Card(
-                      child: Padding(
-                        padding: const EdgeInsets.all(16),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            const Text(
-                              'Generate Sharing Code',
-                              style: TextStyle(
-                                fontSize: 18,
-                                fontWeight: FontWeight.bold,
+                      Card(
+                        child: Padding(
+                          padding: const EdgeInsets.all(16),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Text(
+                                'Generate Sharing Code',
+                                style: TextStyle(
+                                  fontSize: 18,
+                                  fontWeight: FontWeight.bold,
+                                ),
                               ),
-                            ),
                             const SizedBox(height: 16),
                             // Permission selector
                             DropdownButtonFormField<String>(
@@ -300,70 +300,70 @@ class _DeviceSharingPageState extends State<DeviceSharingPage> {
                                   });
                                 }
                               },
-                            ),
-                            const SizedBox(height: 16),
-                            if (_sharingCode != null) ...[
-                              Container(
-                                padding: const EdgeInsets.all(16),
-                                decoration: BoxDecoration(
-                                  color: AppTheme.muted.withValues(alpha: 0.3),
-                                  borderRadius: BorderRadius.circular(8),
-                                  border: Border.all(color: AppTheme.border),
-                                ),
-                                child: Row(
-                                  children: [
-                                    Expanded(
-                                      child: Text(
-                                        _sharingCode!,
-                                        style: TextStyle(
-                                          fontSize: 24,
-                                          fontWeight: FontWeight.bold,
-                                          letterSpacing: 4,
-                                          color: AppTheme.primary,
+                              ),
+                              const SizedBox(height: 16),
+                              if (_sharingCode != null) ...[
+                                Container(
+                                  padding: const EdgeInsets.all(16),
+                                  decoration: BoxDecoration(
+                                    color: AppTheme.muted.withValues(alpha: 0.3),
+                                    borderRadius: BorderRadius.circular(8),
+                                    border: Border.all(color: AppTheme.border),
+                                  ),
+                                  child: Row(
+                                    children: [
+                                      Expanded(
+                                        child: Text(
+                                          _sharingCode!,
+                                          style: TextStyle(
+                                            fontSize: 24,
+                                            fontWeight: FontWeight.bold,
+                                            letterSpacing: 4,
+                                            color: AppTheme.primary,
+                                          ),
+                                          textAlign: TextAlign.center,
                                         ),
-                                        textAlign: TextAlign.center,
                                       ),
-                                    ),
-                                    IconButton(
-                                      icon: const Icon(Icons.copy),
-                                      onPressed: _copySharingCode,
-                                      tooltip: 'Copy code',
-                                    ),
-                                  ],
+                                      IconButton(
+                                        icon: const Icon(Icons.copy),
+                                        onPressed: _copySharingCode,
+                                        tooltip: 'Copy code',
+                                      ),
+                                    ],
+                                  ),
                                 ),
-                              ),
-                              const SizedBox(height: 12),
-                              Text(
-                                'Share this code with others to grant access to this zone.',
-                                style: TextStyle(
-                                  fontSize: 12,
-                                  color: AppTheme.mutedForeground,
+                                const SizedBox(height: 12),
+                                Text(
+                                  'Share this code with others to grant access to this zone.',
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    color: AppTheme.mutedForeground,
+                                  ),
                                 ),
-                              ),
-                            ] else
-                              SizedBox(
-                                width: double.infinity,
-                                child: ElevatedButton.icon(
-                                  onPressed: _generateSharingCode,
-                                  icon: const Icon(Icons.qr_code),
-                                  label: const Text('Generate Sharing Code'),
+                              ] else
+                                SizedBox(
+                                  width: double.infinity,
+                                  child: ElevatedButton.icon(
+                                    onPressed: _generateSharingCode,
+                                    icon: const Icon(Icons.qr_code),
+                                    label: const Text('Generate Sharing Code'),
+                                  ),
                                 ),
-                              ),
-                          ],
+                            ],
+                          ),
                         ),
                       ),
-                    ),
-                    const SizedBox(height: 24),
+                      const SizedBox(height: 24),
                     // Shared users section (only show if user has zones)
-                    const Text(
-                      'Shared Users',
-                      style: TextStyle(
-                        fontSize: 18,
-                        fontWeight: FontWeight.bold,
+                      const Text(
+                        'Shared Users',
+                        style: TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.bold,
+                        ),
                       ),
-                    ),
-                    const SizedBox(height: 12),
-                    _sharedUsers.isEmpty
+                      const SizedBox(height: 12),
+                      _sharedUsers.isEmpty
                           ? Card(
                               child: Padding(
                                 padding: const EdgeInsets.all(24),
@@ -400,20 +400,35 @@ class _DeviceSharingPageState extends State<DeviceSharingPage> {
                               itemCount: _sharedUsers.length,
                               itemBuilder: (context, index) {
                                 final user = _sharedUsers[index];
+                                
+                                // Logic to ensure we display a proper name
+                                String displayName = user.name;
+                                // If name is an email, extract the username part
+                                if (displayName.contains('@')) {
+                                  displayName = displayName.split('@')[0];
+                                  // Capitalize first letter
+                                  if (displayName.isNotEmpty) {
+                                    displayName = displayName[0].toUpperCase() + displayName.substring(1);
+                                  }
+                                }
+                                
                                 return Card(
                                   margin: const EdgeInsets.only(bottom: 12),
                                   child: ListTile(
                                     leading: CircleAvatar(
                                       backgroundColor: AppTheme.primary,
                                       child: Text(
-                                        user.name[0].toUpperCase(),
+                                        displayName.isNotEmpty ? displayName[0].toUpperCase() : 'U',
                                         style: TextStyle(
                                           color: AppTheme.primaryForeground,
                                           fontWeight: FontWeight.bold,
                                         ),
                                       ),
                                     ),
-                                    title: Text(user.name),
+                                    title: Text(
+                                      displayName,
+                                      style: const TextStyle(fontWeight: FontWeight.bold),
+                                    ),
                                     subtitle: Column(
                                       crossAxisAlignment: CrossAxisAlignment.start,
                                       children: [
@@ -485,10 +500,10 @@ class _DeviceSharingPageState extends State<DeviceSharingPage> {
                         ],
                       ),
                     ),
+                            ),
+                    ],
                   ),
-                ],
-              ),
-            ),
+                ),
     );
   }
 

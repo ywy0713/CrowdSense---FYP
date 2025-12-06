@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart'; // Import for DeviceOrientation
 import 'package:permission_handler/permission_handler.dart';
 
 /// Service for accessing local device camera using Flutter camera package
@@ -43,6 +44,9 @@ class LocalCameraService {
       );
 
       await _controller!.initialize();
+      // Lock capture orientation to portrait for mobile usage
+      await _controller!.lockCaptureOrientation(DeviceOrientation.portraitUp);
+      
       _isInitialized = true;
       debugPrint('✅ Camera initialized successfully');
       return true;
@@ -102,6 +106,12 @@ class LocalCameraService {
 
   /// Get current camera
   static CameraDescription? get camera => _camera;
+
+  /// Get camera sensor orientation
+  static int get sensorOrientation => _camera?.sensorOrientation ?? 0;
+
+  /// Get camera lens direction
+  static CameraLensDirection get lensDirection => _camera?.lensDirection ?? CameraLensDirection.back;
 
   /// Dispose camera service
   static Future<void> dispose() async {

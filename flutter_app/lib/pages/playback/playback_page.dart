@@ -241,7 +241,12 @@ class _PlaybackPageState extends State<PlaybackPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('View Playback'),
+        title: const Text(
+          'View Playback',
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(fontSize: 20),
+        ),
         actions: [
           if (_storageInfo != null)
             Padding(
@@ -335,6 +340,31 @@ class _PlaybackPageState extends State<PlaybackPage> {
                       padding: const EdgeInsets.all(16),
                       child: Column(
                         children: [
+                          // Local mode warning
+                          if (_selectedZoneId != null && 
+                              _zones.firstWhere((z) => z.id == _selectedZoneId).cameraUrl == 'local')
+                            Container(
+                              padding: const EdgeInsets.all(12),
+                              margin: const EdgeInsets.only(bottom: 16),
+                              decoration: BoxDecoration(
+                                color: Colors.orange.shade50,
+                                border: Border.all(color: Colors.orange.shade300),
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              child: Row(
+                                children: [
+                                  Icon(Icons.info_outline, color: Colors.orange.shade700),
+                                  const SizedBox(width: 12),
+                                  Expanded(
+                                    child: Text(
+                                      'Local Camera mode does not support cloud recording. Only real-time monitoring is available.',
+                                      style: TextStyle(color: Colors.orange.shade900, fontSize: 13),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+
                           DropdownButtonFormField<String>(
                             value: _selectedZoneId,
                             decoration: const InputDecoration(

@@ -187,7 +187,11 @@ class SharingService {
 
       // Get user profile
       final userProfile = await _getUserProfile(user.uid);
-      final userName = userProfile['displayName'] ?? user.email ?? 'Unknown';
+      // Use profile display name if available, otherwise use email username part, or fallback to email
+      String userName = userProfile['displayName'] ?? 'Unknown';
+      if (userName == 'Unknown' && user.email != null) {
+        userName = user.email!.split('@')[0];
+      }
       final userEmail = user.email ?? '';
 
       // Add user to zone's shared users

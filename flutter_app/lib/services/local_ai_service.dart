@@ -4,7 +4,7 @@ import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:google_mlkit_object_detection/google_mlkit_object_detection.dart';
-import 'package:image/image.dart' as img;
+import '../services/local_camera_service.dart'; // Import LocalCameraService to access sensorOrientation
 
 /// Enhanced Local AI Service using ML Kit Person Detection
 /// Provides YOLOv8-level accuracy for people detection on mobile devices
@@ -12,6 +12,7 @@ class LocalAIService {
   static bool _isInitialized = false;
   static Function(int count, double confidence)? _onDetectionResult;
   static int _frameCount = 0;
+  static bool _isProcessing = false; // Flag to prevent concurrent processing
   
   // ML Kit Object Detector
   static ObjectDetector? _objectDetector;
@@ -20,8 +21,12 @@ class LocalAIService {
   static int _detectedCount = 0;
   static double _confidence = 0.0;
   
+  // Stabilization buffer (Smoothing)
+  static final List<int> _countBuffer = [];
+  static const int _bufferSize = 5; // Keep last 5 detections
+  
   // Performance optimization: process every N frames
-  static const int _frameSkipCount = 5; // Process every 5th frame (~6 FPS on 30 FPS camera)
+  static const int _frameSkipCount = 2; // Process every 2nd frame (more frequent updates)
 
   /// Initialize local AI service with ML Kit
   static Future<bool> initialize() async {
@@ -30,13 +35,18 @@ class LocalAIService {
       // Using default ObjectDetectorOptions which is optimized for mobile
       final options = ObjectDetectorOptions(
         mode: DetectionMode.stream,
-        classifyObjects: false, // We only need detection, not classification
+        classifyObjects: true, // Need classification to identify "person"
         multipleObjects: true, // Detect multiple people
       );
       
       _objectDetector = ObjectDetector(options: options);
       
       _isInitialized = true;
+      _countBuffer.clear(); // Reset buffer on init
+      // Initialize buffer with 0 to avoid empty state issues
+      for (int i = 0; i < _bufferSize; i++) {
+        _countBuffer.add(0);
+      }
       debugPrint('✅ Local AI Service initialized with ML Kit Person Detection');
       return true;
     } catch (e) {
@@ -49,38 +59,89 @@ class LocalAIService {
   /// Process camera image for people detection using ML Kit
   static Future<void> processImage(CameraImage cameraImage) async {
     if (!_isInitialized || _objectDetector == null) return;
+    
+    // Drop frame if previous one is still processing
+    if (_isProcessing) return;
 
     try {
       _frameCount++;
       
       // Skip frames for performance optimization
       if (_frameCount % _frameSkipCount != 0) return;
+      
+      _isProcessing = true;
 
       // Convert CameraImage to InputImage for ML Kit
-      final inputImage = await _convertCameraImageToInputImage(cameraImage);
-      if (inputImage == null) return;
+      final inputImage = _convertCameraImageToInputImage(cameraImage);
+      if (inputImage == null) {
+        _isProcessing = false;
+        return;
+      }
 
       // Run detection
       final List<DetectedObject> objects = await _objectDetector!.processImage(inputImage);
       
-      // Filter for person class (class 0 in COCO dataset)
-      // ML Kit Object Detection uses COCO classes where class 0 is person
+      // For testing: Count ALL detected objects to prove the system is "alive"
+      // The Base model often classifies people as "Fashion good" or generic objects
+      // Once we see numbers > 0, we can refine the filtering
       int personCount = 0;
       double totalConfidence = 0.0;
       
-      for (final object in objects) {
-        // Check if detected object is a person
-        // ML Kit labels person as "person" or we can check by bounding box characteristics
-        // For simplicity, we'll count all detected objects as people
-        // In production, you might want to filter by labels if available
-        personCount++;
-        totalConfidence += object.trackingId != null ? 0.8 : 0.6; // Higher confidence for tracked objects
+      // DEBUG: Print all detected objects
+      if (objects.isNotEmpty) {
+        final labels = objects.map((o) => o.labels.map((l) => '${l.text}(${l.confidence.toStringAsFixed(2)})').join(', ')).join(' | ');
+        debugPrint('🔍 Raw detection: ${objects.length} objects -> $labels');
       }
       
+      for (final object in objects) {
+         // Accumulate confidence
+         if (object.labels.isNotEmpty) {
+           // Check if it's likely a person
+           // ML Kit Base model labels: "Person", "Fashion good" (often people), "Top" (clothing)
+           // STRICTER FILTERING: Only allow high confidence "Fashion good" or explicit "Person"
+           final label = object.labels.first.text.toLowerCase();
+           final confidence = object.labels.first.confidence;
+           
+           // Only count as person if:
+           // 1. Explicitly "person" or "human"
+           // 2. "Fashion good" / "Top" / "Jeans" ONLY if confidence > 0.7 (avoid false positives on floor/objects)
+           
+           bool isPerson = false;
+           
+           if (label.contains('person') || label.contains('human')) {
+             isPerson = true;
+           } else if ((label.contains('fashion') || label.contains('top') || label.contains('jeans')) && confidence > 0.7) {
+             isPerson = true;
+           }
+           
+           if (isPerson) {
+             personCount++;
+             totalConfidence += confidence;
+           }
+         } else {
+           // Default confidence if no labels - skip for now to reduce noise
+           // personCount++;
+           // totalConfidence += (object.trackingId != null ? 0.8 : 0.5);
+         }
+      }
+      
+      // Apply smoothing (Stabilization)
+      _countBuffer.add(personCount);
+      if (_countBuffer.length > _bufferSize) {
+        _countBuffer.removeAt(0);
+      }
+      
+      // Calculate smoothed count (use mode - most frequent value)
+      int smoothedCount = 0;
+      if (_countBuffer.isNotEmpty) {
+        smoothedCount = _getMode(_countBuffer);
+      }
+      
+      // Only update if smoothed count is stable or buffer is full
       final averageConfidence = personCount > 0 ? totalConfidence / personCount : 0.0;
       
       // Update detection results
-      _detectedCount = personCount;
+      _detectedCount = smoothedCount; // Use smoothed count
       _confidence = averageConfidence;
 
       // Callback with detection results
@@ -88,36 +149,63 @@ class LocalAIService {
         _onDetectionResult!(_detectedCount, _confidence);
       }
       
-      debugPrint('👥 Detected $personCount people with confidence ${averageConfidence.toStringAsFixed(2)}');
+      if (personCount > 0 || smoothedCount > 0) {
+        debugPrint('👥 Detected $personCount objects (Smoothed: $smoothedCount) with confidence ${averageConfidence.toStringAsFixed(2)}');
+      }
     } catch (e) {
       debugPrint('❌ Error processing image: $e');
+    } finally {
+      _isProcessing = false;
     }
   }
 
+  /// Helper to get the mode (most frequent value) from a list
+  static int _getMode(List<int> list) {
+    if (list.isEmpty) return 0;
+    
+    final Map<int, int> frequency = {};
+    for (final item in list) {
+      frequency[item] = (frequency[item] ?? 0) + 1;
+    }
+    
+    int mode = list.first;
+    int maxFreq = 0;
+    
+    frequency.forEach((key, value) {
+      if (value > maxFreq) {
+        maxFreq = value;
+        mode = key;
+      }
+    });
+    
+    return mode;
+  }
+
   /// Convert CameraImage to InputImage for ML Kit
-  static Future<InputImage?> _convertCameraImageToInputImage(CameraImage cameraImage) async {
+  static InputImage? _convertCameraImageToInputImage(CameraImage cameraImage) {
     try {
+      final rotation = _getRotation(LocalCameraService.sensorOrientation);
+      
       if (cameraImage.format.group == ImageFormatGroup.yuv420) {
-        // Get Y plane for YUV420
-        final yBuffer = cameraImage.planes[0].bytes;
+        // Correctly convert YUV420_888 to NV21 format required by ML Kit on Android
+        final nv21Bytes = _yuv420ToNv21(cameraImage);
         
-        // Create InputImage from YUV420
         final inputImageData = InputImageMetadata(
           size: Size(cameraImage.width.toDouble(), cameraImage.height.toDouble()),
-          rotation: InputImageRotation.rotation0deg,
-          format: InputImageFormat.yuv420,
-          bytesPerRow: cameraImage.planes[0].bytesPerRow,
+          rotation: rotation,
+          format: InputImageFormat.nv21, // Use NV21 format
+          bytesPerRow: cameraImage.width, // CRITICAL: Our manual NV21 conversion packs bytes tightly, so stride = width
         );
         
         return InputImage.fromBytes(
-          bytes: yBuffer,
+          bytes: nv21Bytes,
           metadata: inputImageData,
         );
       } else if (cameraImage.format.group == ImageFormatGroup.bgra8888) {
-        // For BGRA format
+        // For BGRA format (iOS usually)
         final inputImageData = InputImageMetadata(
           size: Size(cameraImage.width.toDouble(), cameraImage.height.toDouble()),
-          rotation: InputImageRotation.rotation0deg,
+          rotation: rotation,
           format: InputImageFormat.bgra8888,
           bytesPerRow: cameraImage.planes[0].bytesPerRow,
         );
@@ -126,80 +214,82 @@ class LocalAIService {
           bytes: cameraImage.planes[0].bytes,
           metadata: inputImageData,
         );
-      } else {
-        // Fallback: convert to image and then to InputImage
-        final image = await _convertCameraImageToImage(cameraImage);
-        if (image == null) return null;
-        
-        final inputImageData = InputImageMetadata(
-          size: Size(image.width.toDouble(), image.height.toDouble()),
-          rotation: InputImageRotation.rotation0deg,
-          format: InputImageFormat.nv21,
-          bytesPerRow: image.width * 3, // RGB format
-        );
-        
-        // Convert image to bytes (RGB format)
-        final imageBytes = Uint8List(image.width * image.height * 3);
-        int index = 0;
-        for (int y = 0; y < image.height; y++) {
-          for (int x = 0; x < image.width; x++) {
-            final pixel = image.getPixel(x, y);
-            imageBytes[index++] = pixel.r.toInt();
-            imageBytes[index++] = pixel.g.toInt();
-            imageBytes[index++] = pixel.b.toInt();
-          }
-        }
-        return InputImage.fromBytes(
-          bytes: imageBytes,
-          metadata: inputImageData,
-        );
-      }
+      } 
+      return null;
     } catch (e) {
       debugPrint('❌ Error converting camera image to InputImage: $e');
       return null;
     }
   }
-
-  /// Convert CameraImage to image.Image for fallback
-  static Future<img.Image?> _convertCameraImageToImage(CameraImage cameraImage) async {
-    try {
-      if (cameraImage.format.group == ImageFormatGroup.yuv420) {
-        final yBuffer = cameraImage.planes[0].bytes;
-        final uBuffer = cameraImage.planes[1].bytes;
-        final vBuffer = cameraImage.planes[2].bytes;
-        
-        // Convert YUV420 to RGB
-        final image = img.Image(
-          width: cameraImage.width,
-          height: cameraImage.height,
-        );
-        
-        // Simplified YUV to RGB conversion
-        // In production, use proper conversion algorithm
-        for (int y = 0; y < cameraImage.height; y++) {
-          for (int x = 0; x < cameraImage.width; x++) {
-            final yIndex = y * cameraImage.planes[0].bytesPerRow + x;
-            final uvIndex = (y ~/ 2) * cameraImage.planes[1].bytesPerRow + (x ~/ 2);
-            
-            final yValue = yBuffer[yIndex];
-            final uValue = uBuffer[uvIndex];
-            final vValue = vBuffer[uvIndex];
-            
-            // YUV to RGB conversion
-            final r = (yValue + 1.402 * (vValue - 128)).clamp(0, 255).toInt();
-            final g = (yValue - 0.344 * (uValue - 128) - 0.714 * (vValue - 128)).clamp(0, 255).toInt();
-            final b = (yValue + 1.772 * (uValue - 128)).clamp(0, 255).toInt();
-            
-            image.setPixel(x, y, img.ColorRgb8(r, g, b));
-          }
+  
+  /// Helper to convert Android YUV420 to NV21
+  static Uint8List _yuv420ToNv21(CameraImage image) {
+    final int width = image.width;
+    final int height = image.height;
+    
+    // YUV420_888 to NV21 conversion
+    // NV21 pattern: YYYYYYYY... VUVUVU...
+    
+    final int ySize = width * height;
+    final int uvSize = width * height ~/ 2;
+    final Uint8List nv21 = Uint8List(ySize + uvSize);
+    
+    final yPlane = image.planes[0];
+    final uPlane = image.planes[1];
+    final vPlane = image.planes[2];
+    
+    final yBuffer = yPlane.bytes;
+    final uBuffer = uPlane.bytes;
+    final vBuffer = vPlane.bytes;
+    
+    // Copy Y channel
+    // Handle row stride
+    if (yPlane.bytesPerRow == width) {
+      nv21.setRange(0, ySize, yBuffer);
+    } else {
+      int srcOffset = 0;
+      int dstOffset = 0;
+      for (int i = 0; i < height; i++) {
+        for (int j = 0; j < width; j++) {
+           nv21[dstOffset + j] = yBuffer[srcOffset + j];
         }
-        
-        return image;
+        srcOffset += yPlane.bytesPerRow;
+        dstOffset += width;
       }
-      return null;
-    } catch (e) {
-      debugPrint('❌ Error converting camera image: $e');
-      return null;
+    }
+    
+    // Copy UV channels (interleaved V then U for NV21)
+    // Downsample by 2
+    int uvIndex = ySize;
+    final int uvPixelStride = uPlane.bytesPerPixel ?? 1;
+    final int uvRowStride = uPlane.bytesPerRow;
+    
+    for (int y = 0; y < height ~/ 2; y++) {
+      for (int x = 0; x < width ~/ 2; x++) {
+        final int srcIndex = y * uvRowStride + x * uvPixelStride;
+        
+        // V first
+        nv21[uvIndex++] = vBuffer[srcIndex];
+        // U second
+        nv21[uvIndex++] = uBuffer[srcIndex];
+      }
+    }
+    
+    return nv21;
+  }
+  
+  static InputImageRotation _getRotation(int sensorOrientation) {
+    switch (sensorOrientation) {
+      case 0:
+        return InputImageRotation.rotation0deg;
+      case 90:
+        return InputImageRotation.rotation90deg;
+      case 180:
+        return InputImageRotation.rotation180deg;
+      case 270:
+        return InputImageRotation.rotation270deg;
+      default:
+        return InputImageRotation.rotation0deg;
     }
   }
 
@@ -236,3 +326,4 @@ class LocalAIService {
     }
   }
 }
+

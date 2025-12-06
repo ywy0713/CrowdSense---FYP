@@ -58,10 +58,11 @@ class SummaryReportDialog extends StatelessWidget {
                   child: const Text(
                     'Summary Report',
                     style: TextStyle(
-                      fontSize: 24,
+                      fontSize: 22,
                       fontWeight: FontWeight.bold,
                     ),
-                    overflow: TextOverflow.ellipsis,
+                    maxLines: 2,
+                    overflow: TextOverflow.visible,
                   ),
                 ),
                 IconButton(
