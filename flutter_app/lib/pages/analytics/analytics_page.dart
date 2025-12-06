@@ -87,10 +87,15 @@ class _AnalyticsPageState extends ConsumerState<AnalyticsPage> {
     });
 
     try {
+      // Always load data for TODAY for the chart/stats
+      final now = DateTime.now();
+      final startOfDay = DateTime(now.year, now.month, now.day);
+      final endOfDay = DateTime(now.year, now.month, now.day, 23, 59, 59);
+
       final data = await DataService.getAnalyticsData(
         _selectedZoneId!,
-        _startDate.millisecondsSinceEpoch,
-        _endDate.millisecondsSinceEpoch,
+        startOfDay.millisecondsSinceEpoch,
+        endOfDay.millisecondsSinceEpoch,
       );
       setState(() {
         _analyticsData = data;
@@ -115,7 +120,8 @@ class _AnalyticsPageState extends ConsumerState<AnalyticsPage> {
         _startDate = picked.start;
         _endDate = picked.end;
       });
-      _loadAnalytics();
+      // Do NOT reload analytics, as the view is strictly for TODAY.
+      // The selected range is only for the report generation.
     }
   }
 
@@ -195,21 +201,13 @@ class _AnalyticsPageState extends ConsumerState<AnalyticsPage> {
                           SizedBox(
                             width: double.infinity,
                             child: ElevatedButton.icon(
-                              onPressed: _analyticsData.isEmpty ? null : _generateSummaryReport,
+                              onPressed: _generateSummaryReport,
                               icon: const Icon(Icons.summarize),
-                              label: Text(_analyticsData.isEmpty 
-                                ? 'Generate Summary Report (No Data)' 
-                                : 'Generate Summary Report'),
+                              label: const Text('Generate Summary Report'),
                               style: ElevatedButton.styleFrom(
-                                backgroundColor: _analyticsData.isEmpty 
-                                  ? AppTheme.muted 
-                                  : AppTheme.primary,
-                                foregroundColor: _analyticsData.isEmpty 
-                                  ? AppTheme.mutedForeground 
-                                  : Colors.white,
+                                backgroundColor: AppTheme.primary,
+                                foregroundColor: Colors.white,
                                 padding: const EdgeInsets.symmetric(vertical: 16),
-                                disabledBackgroundColor: AppTheme.muted,
-                                disabledForegroundColor: AppTheme.mutedForeground,
                               ),
                             ),
                           ),
@@ -364,7 +362,7 @@ class _AnalyticsPageState extends ConsumerState<AnalyticsPage> {
                 return Padding(
                   padding: const EdgeInsets.only(top: 8),
                   child: Text(
-                    '${date.month}/${date.day}\n${date.hour}:${date.minute.toString().padLeft(2, '0')}',
+                    '${date.hour}:${date.minute.toString().padLeft(2, '0')}',
                     style: const TextStyle(fontSize: 9),
                     textAlign: TextAlign.center,
                   ),
@@ -452,7 +450,7 @@ class _AnalyticsPageState extends ConsumerState<AnalyticsPage> {
   }
 
   Future<void> _generateSummaryReport() async {
-    if (_selectedZoneId == null || _analyticsData.isEmpty) return;
+    if (_selectedZoneId == null) return;
 
     // Show loading dialog
     showDialog(
@@ -464,6 +462,21 @@ class _AnalyticsPageState extends ConsumerState<AnalyticsPage> {
     try {
       // Get zone data
       final zone = _zones.firstWhere((z) => z.id == _selectedZoneId);
+
+      // Fetch report data for the selected range
+      final reportAnalyticsData = await DataService.getAnalyticsData(
+        _selectedZoneId!,
+        _startDate.millisecondsSinceEpoch,
+        _endDate.millisecondsSinceEpoch,
+      );
+
+      if (reportAnalyticsData.isEmpty) {
+        Navigator.of(context).pop(); // Close loading
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('No data found for the selected period.')),
+        );
+        return;
+      }
       
       // Get alerts in the date range
       final alerts = await DataService.getAlertsInRange(
@@ -474,8 +487,8 @@ class _AnalyticsPageState extends ConsumerState<AnalyticsPage> {
 
       // Find peak time
       CountSnapshot? peakSnapshot;
-      if (_analyticsData.isNotEmpty) {
-        peakSnapshot = _analyticsData.reduce((a, b) => a.count > b.count ? a : b);
+      if (reportAnalyticsData.isNotEmpty) {
+        peakSnapshot = reportAnalyticsData.reduce((a, b) => a.count > b.count ? a : b);
       }
 
       // Filter alerts by level
@@ -483,7 +496,7 @@ class _AnalyticsPageState extends ConsumerState<AnalyticsPage> {
       final highAlerts = alerts.where((a) => a.level == 'high').toList();
 
       // Calculate total people count
-      final totalPeople = _analyticsData.map((e) => e.count).reduce((a, b) => a + b);
+      final totalPeople = reportAnalyticsData.map((e) => e.count).reduce((a, b) => a + b);
 
       // Generate recommendation
       final recommendation = _generateRecommendation(
@@ -503,7 +516,7 @@ class _AnalyticsPageState extends ConsumerState<AnalyticsPage> {
         criticalAlerts: criticalAlerts,
         highAlerts: highAlerts,
         totalPeople: totalPeople,
-        analyticsData: _analyticsData,
+        analyticsData: reportAnalyticsData,
         thresholds: zone.thresholds,
         recommendation: recommendation,
         averageServiceSpeed: zone.averageServiceSpeed,
