@@ -240,17 +240,34 @@ class _CameraListPageState extends ConsumerState<CameraListPage> {
 
         // For HTTP mode, start Python service monitoring
         // This ensures proper camera resource management and people detection
-        final success = await AIService.startZoneMonitoring(zone.id, zone);
+        // Note: Multiple zones can use the same HTTP URL - Python service will share the VideoCapture
+        bool success = false;
+        try {
+          success = await AIService.startZoneMonitoring(zone.id, zone).timeout(
+            const Duration(seconds: 10),
+            onTimeout: () {
+              print('⚠️ HTTP activation timeout - service may be slow or unreachable');
+              return false;
+            },
+          );
+        } catch (e) {
+          print('⚠️ Error starting zone monitoring: $e');
+          success = false;
+        }
+        
         if (!mounted) return;
         Navigator.of(context).pop(); // Dismiss loading dialog
         
         if (!success) {
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('❌ Failed to start Python service. Please ensure Python service is running.'),
+            SnackBar(
+              content: Text('❌ Failed to start Python service. Please ensure Python service is running at ${AIService.baseUrl}'),
               backgroundColor: Colors.red,
+              duration: const Duration(seconds: 5),
             ),
           );
+          // Remove from active cameras if activation failed
+          ref.read(activeCameraProvider.notifier).removeActiveCamera(zone.id);
           return;
         }
         

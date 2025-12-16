@@ -14,7 +14,7 @@ class AIService {
       // For physical Android device, replace '10.0.2.2' with your computer's IP address (e.g., 192.168.1.5)
       // Run 'ipconfig' (Windows) or 'ifconfig' (Mac/Linux) on your computer to find it.
       // return 'http://10.0.2.2:8000'; // Use this for Emulator
-      return 'http://192.168.1.13:8000'; // REPLACE THIS with your computer's IP for Physical Device
+      return 'http://192.168.1.4:8000'; // REPLACE THIS with your computer's IP for Physical Device
     } else if (Platform.isIOS) {
       // iOS simulator can use localhost
       return 'http://localhost:8000';

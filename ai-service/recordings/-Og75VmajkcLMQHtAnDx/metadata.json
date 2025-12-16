@@ -1,0 +1,108 @@
+{
+  "videos": [
+    {
+      "filename": "recording_20251211_222156_count_0_to_1.mp4",
+      "path": "recordings\\-Og75VmajkcLMQHtAnDx\\recording_20251211_222156_count_0_to_1.mp4",
+      "timestamp": 1765434116831,
+      "trigger_reason": "count_0_to_1",
+      "zone_id": "-Og75VmajkcLMQHtAnDx",
+      "duration_seconds": 10
+    },
+    {
+      "filename": "recording_20251211_222244_threshold_2.mp4",
+      "path": "recordings\\-Og75VmajkcLMQHtAnDx\\recording_20251211_222244_threshold_2.mp4",
+      "timestamp": 1765434165135,
+      "trigger_reason": "threshold_2",
+      "zone_id": "-Og75VmajkcLMQHtAnDx",
+      "duration_seconds": 10
+    },
+    {
+      "filename": "recording_20251211_222345_threshold_8.mp4",
+      "path": "recordings\\-Og75VmajkcLMQHtAnDx\\recording_20251211_222345_threshold_8.mp4",
+      "timestamp": 1765434227025,
+      "trigger_reason": "threshold_8",
+      "zone_id": "-Og75VmajkcLMQHtAnDx",
+      "duration_seconds": 10
+    },
+    {
+      "filename": "recording_20251211_222648_threshold_2.mp4",
+      "path": "recordings\\-Og75VmajkcLMQHtAnDx\\recording_20251211_222648_threshold_2.mp4",
+      "timestamp": 1765434409036,
+      "trigger_reason": "threshold_2",
+      "zone_id": "-Og75VmajkcLMQHtAnDx",
+      "duration_seconds": 10
+    },
+    {
+      "filename": "recording_20251211_222821_threshold_2.mp4",
+      "path": "recordings\\-Og75VmajkcLMQHtAnDx\\recording_20251211_222821_threshold_2.mp4",
+      "timestamp": 1765434502095,
+      "trigger_reason": "threshold_2",
+      "zone_id": "-Og75VmajkcLMQHtAnDx",
+      "duration_seconds": 10
+    },
+    {
+      "filename": "recording_20251211_223001_threshold_2.mp4",
+      "path": "recordings\\-Og75VmajkcLMQHtAnDx\\recording_20251211_223001_threshold_2.mp4",
+      "timestamp": 1765434601799,
+      "trigger_reason": "threshold_2",
+      "zone_id": "-Og75VmajkcLMQHtAnDx",
+      "duration_seconds": 10
+    },
+    {
+      "filename": "recording_20251211_223104_threshold_2.mp4",
+      "path": "recordings\\-Og75VmajkcLMQHtAnDx\\recording_20251211_223104_threshold_2.mp4",
+      "timestamp": 1765434666376,
+      "trigger_reason": "threshold_2",
+      "zone_id": "-Og75VmajkcLMQHtAnDx",
+      "duration_seconds": 10
+    },
+    {
+      "filename": "recording_20251211_223150_threshold_4.mp4",
+      "path": "recordings\\-Og75VmajkcLMQHtAnDx\\recording_20251211_223150_threshold_4.mp4",
+      "timestamp": 1765434711298,
+      "trigger_reason": "threshold_4",
+      "zone_id": "-Og75VmajkcLMQHtAnDx",
+      "duration_seconds": 10
+    },
+    {
+      "filename": "recording_20251211_223345_threshold_2.mp4",
+      "path": "recordings\\-Og75VmajkcLMQHtAnDx\\recording_20251211_223345_threshold_2.mp4",
+      "timestamp": 1765434825854,
+      "trigger_reason": "threshold_2",
+      "zone_id": "-Og75VmajkcLMQHtAnDx",
+      "duration_seconds": 10
+    },
+    {
+      "filename": "recording_20251211_223502_threshold_2.mp4",
+      "path": "recordings\\-Og75VmajkcLMQHtAnDx\\recording_20251211_223502_threshold_2.mp4",
+      "timestamp": 1765434903622,
+      "trigger_reason": "threshold_2",
+      "zone_id": "-Og75VmajkcLMQHtAnDx",
+      "duration_seconds": 10
+    },
+    {
+      "filename": "recording_20251211_223733_threshold_2.mp4",
+      "path": "recordings\\-Og75VmajkcLMQHtAnDx\\recording_20251211_223733_threshold_2.mp4",
+      "timestamp": 1765435054998,
+      "trigger_reason": "threshold_2",
+      "zone_id": "-Og75VmajkcLMQHtAnDx",
+      "duration_seconds": 10
+    },
+    {
+      "filename": "recording_20251211_223829_threshold_2.mp4",
+      "path": "recordings\\-Og75VmajkcLMQHtAnDx\\recording_20251211_223829_threshold_2.mp4",
+      "timestamp": 1765435110684,
+      "trigger_reason": "threshold_2",
+      "zone_id": "-Og75VmajkcLMQHtAnDx",
+      "duration_seconds": 10
+    },
+    {
+      "filename": "recording_20251211_223916_threshold_2.mp4",
+      "path": "recordings\\-Og75VmajkcLMQHtAnDx\\recording_20251211_223916_threshold_2.mp4",
+      "timestamp": 1765435157170,
+      "trigger_reason": "threshold_2",
+      "zone_id": "-Og75VmajkcLMQHtAnDx",
+      "duration_seconds": 10
+    }
+  ]
+}

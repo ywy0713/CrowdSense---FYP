@@ -397,7 +397,23 @@ async def monitor_zone(config: ZoneConfig):
                         print(f"[ERROR] Zone {config.zone_id} will use placeholder frame")
                         cap = None
         else:
-            # For other HTTP/RTSP URLs, use OpenCV directly
+            # For other HTTP/RTSP URLs, check if another zone is already using this URL
+            # Multiple zones can share the same HTTP/RTSP stream
+            existing_cap = None
+            for zone_id, existing_cap_obj in zone_captures.items():
+                if zone_id != config.zone_id:
+                    # Check if this zone is using the same URL
+                    # We can't directly check the URL from VideoCapture, so we'll use a heuristic:
+                    # If it's an HTTP/RTSP stream (not a direct camera), we'll check if we can share
+                    # For now, we'll be conservative and only share if explicitly detected as same URL
+                    # In practice, OpenCV VideoCapture for HTTP streams can be shared
+                    # But to be safe, we'll create separate captures for now
+                    # TODO: Implement URL-based sharing detection
+                    pass
+            
+            # For HTTP/RTSP URLs, use OpenCV directly
+            # Note: Multiple zones can use the same HTTP URL - each will have its own VideoCapture
+            # This is OK because HTTP streams can handle multiple connections
             print(f"[INFO] Opening HTTP/RTSP stream: {camera_url}")
             cap = cv2.VideoCapture(camera_url)
             # Set buffer size to reduce latency

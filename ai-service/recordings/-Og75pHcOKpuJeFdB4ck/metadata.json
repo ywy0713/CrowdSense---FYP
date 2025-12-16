@@ -1,0 +1,116 @@
+{
+  "videos": [
+    {
+      "filename": "recording_20251211_222201_count_0_to_1.mp4",
+      "path": "recordings\\-Og75pHcOKpuJeFdB4ck\\recording_20251211_222201_count_0_to_1.mp4",
+      "timestamp": 1765434121745,
+      "trigger_reason": "count_0_to_1",
+      "zone_id": "-Og75pHcOKpuJeFdB4ck",
+      "duration_seconds": 10
+    },
+    {
+      "filename": "recording_20251211_222242_threshold_2.mp4",
+      "path": "recordings\\-Og75pHcOKpuJeFdB4ck\\recording_20251211_222242_threshold_2.mp4",
+      "timestamp": 1765434163235,
+      "trigger_reason": "threshold_2",
+      "zone_id": "-Og75pHcOKpuJeFdB4ck",
+      "duration_seconds": 10
+    },
+    {
+      "filename": "recording_20251211_222325_threshold_8.mp4",
+      "path": "recordings\\-Og75pHcOKpuJeFdB4ck\\recording_20251211_222325_threshold_8.mp4",
+      "timestamp": 1765434206507,
+      "trigger_reason": "threshold_8",
+      "zone_id": "-Og75pHcOKpuJeFdB4ck",
+      "duration_seconds": 10
+    },
+    {
+      "filename": "recording_20251211_222427_threshold_8.mp4",
+      "path": "recordings\\-Og75pHcOKpuJeFdB4ck\\recording_20251211_222427_threshold_8.mp4",
+      "timestamp": 1765434268217,
+      "trigger_reason": "threshold_8",
+      "zone_id": "-Og75pHcOKpuJeFdB4ck",
+      "duration_seconds": 10
+    },
+    {
+      "filename": "recording_20251211_222646_threshold_2.mp4",
+      "path": "recordings\\-Og75pHcOKpuJeFdB4ck\\recording_20251211_222646_threshold_2.mp4",
+      "timestamp": 1765434406872,
+      "trigger_reason": "threshold_2",
+      "zone_id": "-Og75pHcOKpuJeFdB4ck",
+      "duration_seconds": 10
+    },
+    {
+      "filename": "recording_20251211_222741_threshold_8.mp4",
+      "path": "recordings\\-Og75pHcOKpuJeFdB4ck\\recording_20251211_222741_threshold_8.mp4",
+      "timestamp": 1765434463570,
+      "trigger_reason": "threshold_8",
+      "zone_id": "-Og75pHcOKpuJeFdB4ck",
+      "duration_seconds": 10
+    },
+    {
+      "filename": "recording_20251211_222958_threshold_2.mp4",
+      "path": "recordings\\-Og75pHcOKpuJeFdB4ck\\recording_20251211_222958_threshold_2.mp4",
+      "timestamp": 1765434599713,
+      "trigger_reason": "threshold_2",
+      "zone_id": "-Og75pHcOKpuJeFdB4ck",
+      "duration_seconds": 10
+    },
+    {
+      "filename": "recording_20251211_223110_threshold_2.mp4",
+      "path": "recordings\\-Og75pHcOKpuJeFdB4ck\\recording_20251211_223110_threshold_2.mp4",
+      "timestamp": 1765434672073,
+      "trigger_reason": "threshold_2",
+      "zone_id": "-Og75pHcOKpuJeFdB4ck",
+      "duration_seconds": 10
+    },
+    {
+      "filename": "recording_20251211_223155_threshold_6.mp4",
+      "path": "recordings\\-Og75pHcOKpuJeFdB4ck\\recording_20251211_223155_threshold_6.mp4",
+      "timestamp": 1765434716569,
+      "trigger_reason": "threshold_6",
+      "zone_id": "-Og75pHcOKpuJeFdB4ck",
+      "duration_seconds": 10
+    },
+    {
+      "filename": "recording_20251211_223342_threshold_2.mp4",
+      "path": "recordings\\-Og75pHcOKpuJeFdB4ck\\recording_20251211_223342_threshold_2.mp4",
+      "timestamp": 1765434823608,
+      "trigger_reason": "threshold_2",
+      "zone_id": "-Og75pHcOKpuJeFdB4ck",
+      "duration_seconds": 10
+    },
+    {
+      "filename": "recording_20251211_223426_threshold_2.mp4",
+      "path": "recordings\\-Og75pHcOKpuJeFdB4ck\\recording_20251211_223426_threshold_2.mp4",
+      "timestamp": 1765434867766,
+      "trigger_reason": "threshold_2",
+      "zone_id": "-Og75pHcOKpuJeFdB4ck",
+      "duration_seconds": 10
+    },
+    {
+      "filename": "recording_20251211_223632_threshold_2.mp4",
+      "path": "recordings\\-Og75pHcOKpuJeFdB4ck\\recording_20251211_223632_threshold_2.mp4",
+      "timestamp": 1765434993262,
+      "trigger_reason": "threshold_2",
+      "zone_id": "-Og75pHcOKpuJeFdB4ck",
+      "duration_seconds": 10
+    },
+    {
+      "filename": "recording_20251211_223745_threshold_2.mp4",
+      "path": "recordings\\-Og75pHcOKpuJeFdB4ck\\recording_20251211_223745_threshold_2.mp4",
+      "timestamp": 1765435065865,
+      "trigger_reason": "threshold_2",
+      "zone_id": "-Og75pHcOKpuJeFdB4ck",
+      "duration_seconds": 10
+    },
+    {
+      "filename": "recording_20251211_223849_threshold_2.mp4",
+      "path": "recordings\\-Og75pHcOKpuJeFdB4ck\\recording_20251211_223849_threshold_2.mp4",
+      "timestamp": 1765435130075,
+      "trigger_reason": "threshold_2",
+      "zone_id": "-Og75pHcOKpuJeFdB4ck",
+      "duration_seconds": 10
+    }
+  ]
+}
